@@ -1,0 +1,53 @@
+# Runs on every push and pull request: formatting, vet, unit tests, and the
+# full integration suite against BOTH MySQL versions we support
+# (5.7 = local MAMP, 8.4 = production) plus Redis.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Go tests (MySQL ${{ matrix.mysql }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.4"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      APP_ENV: local
+      APP_KEY: ci-only-key-0123456789abcdefghijklmnopqrstuvwxyz
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_DATABASE: tribe_core
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      DB_SOCKET: ""
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Formatting and vet
+        run: make vet
+      - name: Build
+        run: make build
+      - name: Tests
+        run: make test TEST_P=2
