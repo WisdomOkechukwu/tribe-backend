@@ -233,7 +233,7 @@ func (service *Service) settlePurchase(requestContext context.Context, transacti
 			if err := databaseTransaction.Model(&models.BillPayment{}).Where("transaction_id = ?", locked.ID).Updates(paymentUpdates).Error; err != nil {
 				return err
 			}
-			title, body = locked.Title+" paid", "₦"+outcome.settledAmount.Decimal(2)+" for "+details.Target
+			title, body = locked.Title+" paid", "₦"+outcome.settledAmount.Display(2)+" for "+details.Target
 		case "gift_buy":
 			if err := databaseTransaction.Model(&models.GiftCardOrder{}).Where("transaction_id = ?", locked.ID).
 				Updates(map[string]any{"status": "completed", "code_encrypted": encryptedCode, "updated_at": now}).Error; err != nil {

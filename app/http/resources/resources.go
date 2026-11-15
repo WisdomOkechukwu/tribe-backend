@@ -6,6 +6,7 @@ package resources
 
 import (
 	"encoding/json"
+	"math/big"
 	"time"
 
 	"github.com/tribe-africa/tribe-backend/app/models"
@@ -85,6 +86,11 @@ var appTypes = map[string]string{
 	"referral_withdraw": "referral",
 }
 
+// internalMetaKeys are keys of transactions.metadata that describe HOW we
+// routed a conversion. They stay in the database for the admin panel but
+// are removed from what the app receives.
+var internalMetaKeys = []string{"uses_ngn_rail"}
+
 // Transaction builds a TransactionResource. decimals maps asset -> decimal places.
 func Transaction(transaction models.Transaction, decimals map[string]int) TransactionResource {
 	amount, _ := money.ParseUnits(transaction.FromAmount)
@@ -107,6 +113,9 @@ func Transaction(transaction models.Transaction, decimals map[string]int) Transa
 		resource.ToAmount = &text
 	}
 	json.Unmarshal(transaction.Metadata, &resource.Meta)
+	for _, key := range internalMetaKeys {
+		delete(resource.Meta, key)
+	}
 	return resource
 }
 
@@ -119,42 +128,68 @@ func Transactions(transactions []models.Transaction, decimals map[string]int) []
 	return list
 }
 
-// SwapLegResource is one hop of a route, for the receipt.
-type SwapLegResource struct {
-	Step       int    `json:"step"`
+// RouteLegResource is the conversion on a quote or a receipt, as the
+// CUSTOMER did it: one step from the asset they paid with to the asset that
+// arrived. How we got there (for example through Naira) is an internal
+// routing detail and is never sent to the app.
+type RouteLegResource struct {
+	Step       int    `json:"step"` // always 1: the app sees one step
 	FromAsset  string `json:"from_asset"`
 	ToAsset    string `json:"to_asset"`
 	FromAmount string `json:"from_amount"`
 	ToAmount   string `json:"to_amount"`
-	Rate       string `json:"rate"`
-	ViaNgnRail bool   `json:"via_ngn_rail"`
+	Rate       string `json:"rate"` // to-units per from-unit, for the whole conversion
 }
 
-// SwapLegs builds route legs with decimal amounts.
-func SwapLegs(legs []models.SwapLeg, decimals map[string]int) []SwapLegResource {
-	list := make([]SwapLegResource, 0, len(legs))
-	for _, leg := range legs {
-		fromAmount, _ := money.ParseUnits(leg.FromAmount)
-		toAmount, _ := money.ParseUnits(leg.ToAmount)
-		list = append(list, SwapLegResource{Step: leg.Step, FromAsset: leg.FromAsset, ToAsset: leg.ToAsset,
-			FromAmount: fromAmount.Decimal(decimals[leg.FromAsset]), ToAmount: toAmount.Decimal(decimals[leg.ToAsset]),
-			Rate: leg.Rate, ViaNgnRail: leg.ViaNgnRail})
+// routeRateDecimalPlaces is how many decimal places a route rate is sent
+// with (the same as the rates stored in swap_legs and quotes).
+const routeRateDecimalPlaces = 18
+
+// CustomerRoute collapses the stored hops of a conversion (swap_legs, in
+// step order) into the single step the customer did: from the first hop's
+// asset and amount to the last hop's asset and amount. A conversion that
+// went USD -> NGN -> GBP is sent as USD -> GBP, so the app never learns that
+// Naira was in the middle. An empty list stays empty (nothing was converted).
+//
+// The rate is the overall one:
+//   - one stored hop: that hop's own rate;
+//   - several hops: quotedRate, the rate of the quote the customer accepted;
+//   - several hops and no quote (a card or gift card paid from another
+//     currency): the amount that arrived divided by the amount converted.
+func CustomerRoute(legs []models.SwapLeg, quotedRate string, decimals map[string]int) []RouteLegResource {
+	if len(legs) == 0 {
+		return []RouteLegResource{}
 	}
-	return list
+	first, last := legs[0], legs[len(legs)-1]
+	fromAmount, _ := money.ParseUnits(first.FromAmount)
+	toAmount, _ := money.ParseUnits(last.ToAmount)
+	rate := first.Rate
+	if len(legs) > 1 {
+		rate = quotedRate
+		if rate == "" && fromAmount.IsPositive() {
+			overall := new(big.Rat).Quo(toAmount.ToRational(decimals[last.ToAsset]), fromAmount.ToRational(decimals[first.FromAsset]))
+			rate = money.FormatRate(overall, routeRateDecimalPlaces)
+		}
+	}
+	return []RouteLegResource{{
+		Step: 1, FromAsset: first.FromAsset, ToAsset: last.ToAsset,
+		FromAmount: fromAmount.Decimal(decimals[first.FromAsset]), ToAmount: toAmount.Decimal(decimals[last.ToAsset]), Rate: rate,
+	}}
 }
 
-// QuoteResource is a price the user can accept before it expires.
+// QuoteResource is a price the user can accept before it expires. Route is
+// always ONE step, from the asset paid to the asset received (see
+// RouteLegResource): the hops in between stay on the server.
 type QuoteResource struct {
-	ID          string            `json:"id"`
-	FromAsset   string            `json:"from_asset"`
-	ToAsset     string            `json:"to_asset"`
-	FromAmount  string            `json:"from_amount"` // total paid, fee included
-	Fee         string            `json:"fee"`
-	ToAmount    string            `json:"to_amount"`
-	Rate        string            `json:"rate"`
-	UsesNgnRail bool              `json:"uses_ngn_rail"`
-	Route       []SwapLegResource `json:"route"`
-	ExpiresAt   time.Time         `json:"expires_at"`
+	ID         string             `json:"id"`
+	FromAsset  string             `json:"from_asset"`
+	ToAsset    string             `json:"to_asset"`
+	FromAmount string             `json:"from_amount"` // total paid, fee included
+	Fee        string             `json:"fee"`
+	ToAmount   string             `json:"to_amount"`
+	Rate       string             `json:"rate"`
+	Route      []RouteLegResource `json:"route"`
+	ExpiresAt  time.Time          `json:"expires_at"`
 }
 
 // CardResource is a virtual card (never the full number or CVV).

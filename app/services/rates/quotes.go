@@ -9,12 +9,19 @@ import (
 
 	"github.com/tribe-africa/tribe-backend/app/apperrors"
 	"github.com/tribe-africa/tribe-backend/app/models"
+	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/pkg/ids"
 )
 
 // CreateQuote prices a conversion and SAVES it, so the user can confirm at
 // exactly this price within QUOTE_LIFETIME_SECONDS (30 s by default).
+//
+// A quote for a service an admin switched off is refused (503
+// SERVICE_DISABLED): there is no point showing a price nobody can use.
 func (service *Service) CreateQuote(requestContext context.Context, userID string, input PriceInput) (*models.Quote, *Price, error) {
+	if err := service.requireQuotedService(requestContext, input); err != nil {
+		return nil, nil, err
+	}
 	price, err := service.PriceConversion(requestContext, input)
 	if err != nil {
 		return nil, nil, err
@@ -47,6 +54,36 @@ func (service *Service) CreateQuote(requestContext context.Context, userID strin
 		return nil, nil, err
 	}
 	return &quote, price, nil
+}
+
+// requireQuotedService checks the service switch a quote is for.
+//
+//   - A swap quote needs the swap service.
+//   - A send quote does not say WHO the money is for yet (a Tribe tag, a
+//     bank account, a crypto wallet), so it is refused only when every kind
+//     of send that could use it is off: the send to a Tribe tag, plus the
+//     outside send that pays out in the quote's to-asset (crypto send for a
+//     coin, Nigerian bank for Naira, global send for other currencies).
+//     The send itself is checked again, exactly, in transfers.Send.
+//
+// Other transaction types (bills, cards) never come through CreateQuote.
+func (service *Service) requireQuotedService(requestContext context.Context, input PriceInput) error {
+	query := service.database.WithContext(requestContext)
+	switch input.TransactionType {
+	case "swap":
+		return shared.RequireService(query, shared.ServiceSwap)
+	case "send":
+		snapshot, err := service.config.Snapshot(requestContext)
+		if err != nil {
+			return err
+		}
+		recipientKind := "bank"
+		if snapshot.Assets[input.ToAsset].Kind == "crypto" {
+			recipientKind = "wallet"
+		}
+		return shared.RequireAnyService(query, shared.SendServiceFor(recipientKind, input.ToAsset), shared.ServiceSendTribe)
+	}
+	return nil
 }
 
 // ConsumeQuote uses a quote ONCE, inside the caller's money transaction.

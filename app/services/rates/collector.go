@@ -77,6 +77,21 @@ func (service *Service) ConfigChanged(requestContext context.Context) {
 	service.config.ConfigChanged(requestContext)
 }
 
+// CheckPriceSource says whether the rate provider can price an asset from a
+// price source (fiat_feed, coinbase or usd_peg). It is asked before an admin
+// adds a currency or switches one on. A provider that cannot answer (the
+// simulator used by the tests) lets everything through.
+func (service *Service) CheckPriceSource(requestContext context.Context, assetCode string, priceSource string) error {
+	rateProvider, err := service.providers.Rates()
+	if err != nil {
+		return err
+	}
+	if priceChecker, ok := rateProvider.(providers.PriceChecker); ok {
+		return priceChecker.CheckPrice(requestContext, assetCode, priceSource)
+	}
+	return nil
+}
+
 // Collect fetches new prices once, stores them and publishes the event.
 func (service *Service) Collect(requestContext context.Context) (*RatesEvent, error) {
 	var assets []models.Asset
@@ -85,14 +100,22 @@ func (service *Service) Collect(requestContext context.Context) (*RatesEvent, er
 	}
 	assetCodes := make([]string, 0, len(assets))
 	providerByAsset := map[string]*string{}
+	priceSourceByAsset := map[string]string{}
 	for _, asset := range assets {
 		assetCodes = append(assetCodes, asset.Code)
 		providerByAsset[asset.Code] = asset.ConversionProviderID
+		priceSourceByAsset[asset.Code] = asset.PriceSource
 	}
 
 	rateProvider, err := service.providers.Rates()
 	if err != nil {
 		return nil, err
+	}
+	// Tell the provider where each asset's price comes from, as the assets
+	// table says. This is how a currency added from the admin panel gets a
+	// rate without its code being written into the provider.
+	if priceSourceAware, ok := rateProvider.(providers.PriceSourceAware); ok {
+		priceSourceAware.SetPriceSources(priceSourceByAsset)
 	}
 	prices, err := rateProvider.FetchPrices(requestContext, assetCodes)
 	if err != nil {

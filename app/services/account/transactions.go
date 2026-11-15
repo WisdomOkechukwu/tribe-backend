@@ -57,14 +57,24 @@ func (service *Service) Transactions(requestContext context.Context, userID stri
 	return transactions, nextCursor, nil
 }
 
-// Transaction returns one of the user's transactions with its route legs.
-func (service *Service) Transaction(requestContext context.Context, userID string, transactionID string) (*models.Transaction, []models.SwapLeg, error) {
-	var transaction models.Transaction
-	err := service.database.WithContext(requestContext).Where("(id = ? OR reference = ?) AND user_id = ?", transactionID, transactionID, userID).Take(&transaction).Error
-	if err != nil {
-		return nil, nil, apperrors.NotFound("Transaction")
+// Transaction returns one of the user's transactions with its route legs
+// (every stored hop, in step order) and quotedRate: the overall rate of the
+// quote it used. quotedRate is only looked up when the route has more than
+// one hop (it is "" otherwise, or when no quote was used), because that is
+// the only case where no single hop carries the overall rate. The mobile
+// receipt needs it to show the conversion as one step.
+func (service *Service) Transaction(requestContext context.Context, userID string, transactionID string) (transaction *models.Transaction, legs []models.SwapLeg, quotedRate string, err error) {
+	query := service.database.WithContext(requestContext)
+	transaction = &models.Transaction{}
+	if err := query.Where("(id = ? OR reference = ?) AND user_id = ?", transactionID, transactionID, userID).Take(transaction).Error; err != nil {
+		return nil, nil, "", apperrors.NotFound("Transaction")
 	}
-	var legs []models.SwapLeg
-	service.database.WithContext(requestContext).Where("transaction_id = ?", transaction.ID).Order("step").Find(&legs)
-	return &transaction, legs, nil
+	query.Where("transaction_id = ?", transaction.ID).Order("step").Find(&legs)
+	if len(legs) > 1 && legs[0].QuoteID != nil {
+		var quote models.Quote
+		if query.Select("rate").Where("id = ?", *legs[0].QuoteID).Take(&quote).Error == nil {
+			quotedRate = quote.Rate
+		}
+	}
+	return transaction, legs, quotedRate, nil
 }

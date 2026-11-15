@@ -107,3 +107,32 @@ func TestArithmetic(test *testing.T) {
 		test.Fatal("Zero is not zero")
 	}
 }
+
+// TestDisplayGroupsThousandsAndTrimsCoinZeros checks the text customers
+// read in their inbox: commas between thousands, cents kept on money, and
+// no trailing zeros on a coin amount.
+func TestDisplayGroupsThousandsAndTrimsCoinZeros(test *testing.T) {
+	cases := []struct {
+		units         string
+		decimalPlaces int
+		want          string
+	}{
+		{"25000000", 2, "250,000.00"},
+		{"66000", 2, "660.00"},
+		{"300000000", 6, "300"},
+		{"500000", 8, "0.005"},
+		{"123456789012", 8, "1,234.56789012"},
+		{"-125000", 2, "-1,250.00"},
+		{"1000", 0, "1,000"},
+		{"5", 2, "0.05"},
+	}
+	for _, testCase := range cases {
+		amount, err := ParseUnits(testCase.units)
+		if err != nil {
+			test.Fatalf("ParseUnits(%s): %v", testCase.units, err)
+		}
+		if got := amount.Display(testCase.decimalPlaces); got != testCase.want {
+			test.Errorf("Display(%s units, %d places) = %s, want %s", testCase.units, testCase.decimalPlaces, got, testCase.want)
+		}
+	}
+}

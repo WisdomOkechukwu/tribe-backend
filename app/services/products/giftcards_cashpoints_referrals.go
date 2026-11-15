@@ -378,7 +378,7 @@ func (service *Service) RedeemCashpoint(requestContext context.Context, actor sh
 		if err := shared.NotifyTransaction(databaseTransaction, transaction, "cashpoint", "Cashpoint collected"); err != nil {
 			return err
 		}
-		return shared.Notify(databaseTransaction, cashpoint.CreatorUserID, "cashpoint", "Your cashpoint was redeemed", "₦"+amount.Decimal(2)+" was collected.", "")
+		return shared.Notify(databaseTransaction, cashpoint.CreatorUserID, "cashpoint", "Your cashpoint was redeemed", "₦"+amount.Display(2)+" was collected.", "")
 	})
 	if err != nil {
 		return nil, err

@@ -14,8 +14,10 @@ type Asset struct {
 	Symbol               string    `json:"symbol"`
 	DecimalPlaces        int       `json:"decimal_places"`
 	ConversionProviderID *string   `json:"conversion_provider_id"`
+	PriceSource          string    `json:"price_source"` // where its live price comes from: fiat_feed | coinbase | usd_peg
 	DisplayOrder         int       `json:"display_order"`
 	Enabled              bool      `json:"enabled"`
+	Version              int       `json:"version"` // edit counter: an update must send the version it last saw
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }

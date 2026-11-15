@@ -110,13 +110,15 @@ func JSON(value any) []byte {
 	return encoded
 }
 
-// configCache is the shared copy of assets, providers, margins and fees
-// (see cache.ConfigCache). bootstrap installs it with UseConfigCache. When
-// it is not installed (a small tool), the helpers below read MySQL.
+// configCache is the shared copy of assets, providers, margins, fees and
+// service switches (see cache.ConfigCache). bootstrap installs it with
+// UseConfigCache. When it is not installed (a small tool), the helpers
+// below and in services.go read MySQL.
 var configCache *cache.ConfigCache
 
-// UseConfigCache makes LoadAsset and AssetDecimals read the shared
-// configuration copy instead of MySQL on every call. Called once at start.
+// UseConfigCache makes LoadAsset, AssetDecimals and the service switch
+// checks read the shared configuration copy instead of MySQL on every
+// call. Called once at start.
 func UseConfigCache(shared *cache.ConfigCache) {
 	configCache = shared
 }

@@ -37,6 +37,21 @@ type BillPayment struct {
 	CreatedAt         time.Time `json:"created_at"`
 }
 
+// Service is the on/off switch of one customer-facing money service, such as
+// swaps or airtime (table: services). The list of codes is fixed in Go
+// (shared.ServiceCatalog) because code enforces them; this row only stores
+// the admin's choice. A service without a row counts as enabled.
+type Service struct {
+	Code            string    `gorm:"primaryKey" json:"code"`
+	Name            string    `json:"name"`
+	Description     string    `json:"description"`
+	Enabled         bool      `json:"enabled"`
+	DisabledMessage *string   `json:"disabled_message"` // what the app shows while it is off (null = a default)
+	Version         int       `json:"version"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 // VaultToken is a prepaid electricity token (table: vault_tokens).
 type VaultToken struct {
 	ID            string     `gorm:"primaryKey" json:"id"`

@@ -36,6 +36,34 @@ type RateProvider interface {
 	FetchPrices(requestContext context.Context, assetCodes []string) (map[string]AssetPrice, error)
 }
 
+// Where an asset's live price comes from (assets.price_source). An admin
+// picks one when adding a currency, so no list of codes lives in the code.
+const (
+	PriceSourceFiatFeed = "fiat_feed" // the daily fiat feed, looked up by currency code
+	PriceSourceCoinbase = "coinbase"  // Coinbase's spot price for CODE-USD
+	PriceSourceUsdPeg   = "usd_peg"   // always exactly one US dollar (stablecoins, and USD itself)
+)
+
+// IsPriceSource is true for one of the three price sources above.
+func IsPriceSource(priceSource string) bool {
+	return priceSource == PriceSourceFiatFeed || priceSource == PriceSourceCoinbase || priceSource == PriceSourceUsdPeg
+}
+
+// PriceSourceAware is implemented by a rate provider that needs to be told
+// where each asset's price comes from (the live provider does; the simulator
+// has its own price table). The rate collector calls it before every
+// collection with what the assets table says.
+type PriceSourceAware interface {
+	SetPriceSources(priceSourceByAsset map[string]string)
+}
+
+// PriceChecker is implemented by a rate provider that can say, BEFORE a
+// currency is added or switched on, whether it is able to price it. It
+// returns nil when it can, and an error a person can read when it cannot.
+type PriceChecker interface {
+	CheckPrice(requestContext context.Context, assetCode string, priceSource string) error
+}
+
 // PayoutResult is what a provider says about a payout.
 type PayoutResult struct {
 	Status            string // succeeded | failed | pending

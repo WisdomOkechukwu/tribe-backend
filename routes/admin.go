@@ -58,6 +58,8 @@ func registerAdminRoutes(router *gin.Engine, application *bootstrap.App) {
 
 	// Rates, margins & fees
 	signedIn.GET("/currencies", can("currencies.view"), controller.Currencies)
+	signedIn.POST("/currencies", can("currencies.manage"), idempotent, controller.CreateCurrency)
+	signedIn.PUT("/currencies/:code", can("currencies.manage"), idempotent, controller.UpdateCurrency)
 	signedIn.GET("/rates", can("currencies.view"), controller.Rates)
 	signedIn.GET("/rates/history", can("currencies.view"), controller.RateHistory)
 	signedIn.GET("/rate-margins", can("markups.view"), controller.RateMargins)
@@ -80,9 +82,12 @@ func registerAdminRoutes(router *gin.Engine, application *bootstrap.App) {
 	signedIn.GET("/ledger-snapshots", can("ledger.view"), controller.LedgerSnapshots)
 	signedIn.GET("/ledger/verify", can("ledger.view"), controller.VerifyLedger)
 
-	// Providers (NGN rail switch) & card designs
+	// Providers (NGN rail switch), service switches & card designs
 	signedIn.GET("/providers", can("providers.view"), controller.Providers)
 	signedIn.PUT("/providers/:id", can("providers.manage"), idempotent, controller.UpdateProvider)
+	// Service switches: turn a customer-facing service (swap, airtime, cards ...) off and back on
+	signedIn.GET("/services", can("services.view"), controller.Services)
+	signedIn.PUT("/services/:code", can("services.manage"), idempotent, controller.UpdateService)
 	signedIn.GET("/card-designs", can("card_designs.manage"), controller.CardDesigns)
 	signedIn.POST("/card-designs", can("card_designs.manage"), idempotent, controller.CreateCardDesign)
 	signedIn.PUT("/card-designs/:id", can("card_designs.manage"), idempotent, controller.SaveCardDesign)

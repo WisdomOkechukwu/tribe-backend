@@ -650,3 +650,86 @@ func (service *Service) UpdateProvider(requestContext context.Context, admin *ad
 	}
 	return &after, err
 }
+
+// ListServices returns the switch of every customer-facing service, in the
+// order of the fixed catalog (shared.ServiceCatalog).
+func (service *Service) ListServices(requestContext context.Context) ([]models.Service, error) {
+	var rows []models.Service
+	if err := service.database.WithContext(requestContext).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	byCode := make(map[string]models.Service, len(rows))
+	for _, row := range rows {
+		byCode[row.Code] = row
+	}
+	list := make([]models.Service, 0, len(shared.ServiceCatalog))
+	for _, definition := range shared.ServiceCatalog {
+		if row, found := byCode[definition.Code]; found {
+			list = append(list, row)
+		}
+	}
+	return list, nil
+}
+
+// ServiceChanges is what an admin can change on a service. A nil field is
+// left as it is.
+type ServiceChanges struct {
+	Enabled         *bool
+	DisabledMessage *string // "" clears the message (the app then shows the default)
+	Version         int     // the version the admin last saw
+}
+
+// UpdateService switches a service on or off and/or changes the message the
+// app shows while it is off (lock + version + audit, like UpdateProvider).
+//
+// Switching a service OFF makes the API refuse it with 503 SERVICE_DISABLED
+// (see shared.RequireService) in every program within about a second.
+// Payments already on their way are not touched: they still settle or refund.
+func (service *Service) UpdateService(requestContext context.Context, admin *adminauth.Admin, code string, changes ServiceChanges) (*models.Service, error) {
+	if !shared.IsService(code) {
+		return nil, apperrors.NotFound("Service")
+	}
+	if changes.Enabled == nil && changes.DisabledMessage == nil {
+		return nil, apperrors.Validation(map[string][]string{"enabled": {"Send enabled, disabled_message or both."}})
+	}
+	var before, after models.Service
+	err := database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
+		// Lock the row so two admins flipping the same switch at once are
+		// handled one after the other; the second one then fails the version check.
+		if err := database.LockForUpdate(databaseTransaction, &before, "code = ?", code); err != nil {
+			return apperrors.NotFound("Service")
+		}
+		if changes.Version != before.Version {
+			return apperrors.ErrStaleData
+		}
+		updates := map[string]any{"version": before.Version + 1, "updated_at": time.Now().UTC()}
+		if changes.Enabled != nil {
+			updates["enabled"] = *changes.Enabled
+		}
+		if changes.DisabledMessage != nil {
+			if message := strings.TrimSpace(*changes.DisabledMessage); message != "" {
+				updates["disabled_message"] = message
+			} else {
+				updates["disabled_message"] = nil // back to the default message
+			}
+		}
+		if err := databaseTransaction.Model(&models.Service{}).Where("code = ?", code).Updates(updates).Error; err != nil {
+			return err
+		}
+		return databaseTransaction.Where("code = ?", code).Take(&after).Error
+	})
+	if err == nil {
+		service.rates.ConfigChanged(requestContext) // every program reloads within a second
+	}
+	if err == nil {
+		summary := "Changed the message of " + before.Name
+		if before.Enabled != after.Enabled {
+			summary = "Switched " + before.Name + " on"
+			if !after.Enabled {
+				summary = "Switched " + before.Name + " off"
+			}
+		}
+		service.adminAuth.Audit(requestContext, admin, "services.update", code, summary, before, after)
+	}
+	return &after, err
+}

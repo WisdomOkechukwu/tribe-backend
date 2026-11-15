@@ -61,6 +61,12 @@ type SendInput struct {
 
 // Send moves the money. Tribe-to-Tribe sends finish instantly; sends to
 // banks/wallets are "pending" until the payout job hears from the provider.
+//
+// Each kind of send is its own service an admin can switch off (see
+// shared.SendServiceFor). sendToTribeUser and sendOut check theirs as soon
+// as they know which one it is, before any money moves. ProcessPayout is
+// NOT checked: a payout that already took the customer's money must still
+// be settled or refunded while the service is off.
 func (service *Service) Send(requestContext context.Context, actor shared.Actor, input SendInput) (*models.Transaction, error) {
 	if err := service.auth.VerifyPin(requestContext, actor.UserID, input.Pin); err != nil {
 		return nil, err
@@ -87,6 +93,9 @@ func (service *Service) FindRecipient(requestContext context.Context, tag string
 
 // sendToTribeUser pays another Tribe user, same or different currency.
 func (service *Service) sendToTribeUser(requestContext context.Context, actor shared.Actor, input SendInput) (*models.Transaction, error) {
+	if err := shared.RequireService(service.database.WithContext(requestContext), shared.ServiceSendTribe); err != nil {
+		return nil, err
+	}
 	recipient, err := service.FindRecipient(requestContext, input.Handle)
 	if err != nil {
 		return nil, err
@@ -233,6 +242,11 @@ func (service *Service) sendOut(requestContext context.Context, actor shared.Act
 			return nil, apperrors.NotFound("Quote")
 		}
 		fromAsset, payoutAsset = preview.FromAsset, preview.ToAsset
+	}
+	// Now we know what arrives and where: a crypto wallet (send_crypto), a
+	// Naira bank account (send_bank) or anything else abroad (send_global).
+	if err := shared.RequireService(service.database.WithContext(requestContext), shared.SendServiceFor(input.RecipientKind, payoutAsset)); err != nil {
+		return nil, err
 	}
 	if _, err := shared.LoadAsset(service.database.WithContext(requestContext), fromAsset); err != nil {
 		return nil, err

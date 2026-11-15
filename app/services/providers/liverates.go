@@ -36,12 +36,16 @@ const fiatReuseLimit = 26 * time.Hour
 // minutes the price is too old to quote on and we report an error instead.
 const cryptoReuseLimit = 2 * time.Minute
 
-// cryptoAssetsFromCoinbase are the crypto assets we price from Coinbase.
+// cryptoAssetsFromCoinbase are the crypto assets we price from Coinbase when
+// nobody has told us an asset's price source (see SetPriceSources). The
+// assets table normally says so for every asset; this list is the starting
+// point before the first collection, and what the tests use.
 // Stablecoins are handled separately (pegged to one dollar), so they are not here.
 var cryptoAssetsFromCoinbase = map[string]bool{"BTC": true, "ETH": true, "SOL": true}
 
 // stablecoinAssets are always worth exactly one US dollar, so we never call out
-// for them.
+// for them. Like the list above, it only applies to an asset whose price
+// source has not been set.
 var stablecoinAssets = map[string]bool{"USD": true, "USDT": true, "USDC": true}
 
 // cachedPrice is a price we fetched successfully, and when we fetched it.
@@ -81,6 +85,7 @@ type LiveRates struct {
 	fiatFetchedAt  time.Time              // when fiatRates arrived (zero = never)
 	fiatCheckedAt  time.Time              // when we last ASKED the fiat feed, even if it failed
 	cryptoPrices   map[string]cachedPrice // asset code -> last good Coinbase price
+	priceSources   map[string]string      // asset code -> fiat_feed | coinbase | usd_peg, from the assets table
 	timeNow        func() time.Time       // the clock; tests replace it to move time forward
 	usingSimulator bool                   // true while we are on the fallback, so we log only the change
 }
@@ -96,6 +101,65 @@ func NewLiveRates(fallback RateProvider) *LiveRates {
 		cryptoPrices:           map[string]cachedPrice{},
 		timeNow:                time.Now,
 	}
+}
+
+// SetPriceSources tells the provider where each asset's price comes from, as
+// the assets table says (assets.price_source). The rate collector calls it
+// before every collection, so a currency an admin has just added is priced
+// from the right feed without any change to this file.
+func (live *LiveRates) SetPriceSources(priceSourceByAsset map[string]string) {
+	live.mutex.Lock()
+	defer live.mutex.Unlock()
+	live.priceSources = priceSourceByAsset
+}
+
+// priceSourceOf returns where an asset's price comes from: what the assets
+// table said, or, for an asset nobody told us about, the built-in lists.
+// The caller must hold live.mutex.
+func (live *LiveRates) priceSourceOf(assetCode string) string {
+	if priceSource := live.priceSources[assetCode]; priceSource != "" {
+		return priceSource
+	}
+	switch {
+	case stablecoinAssets[assetCode]:
+		return PriceSourceUsdPeg
+	case cryptoAssetsFromCoinbase[assetCode]:
+		return PriceSourceCoinbase
+	}
+	return PriceSourceFiatFeed
+}
+
+// CheckPrice says whether an asset can be priced from a price source, by
+// asking the feed right now. An admin adding a currency gets a clear "we
+// cannot price this" instead of a currency that never shows a rate.
+func (live *LiveRates) CheckPrice(requestContext context.Context, assetCode string, priceSource string) error {
+	switch priceSource {
+	case PriceSourceUsdPeg:
+		return nil // always one dollar: nothing to look up
+	case PriceSourceCoinbase:
+		if _, err := live.fetchCoinbaseSpot(requestContext, assetCode); err != nil {
+			return fmt.Errorf("Coinbase has no %s-USD price", assetCode)
+		}
+		return nil
+	case PriceSourceFiatFeed:
+		// Use the rates we already hold when we have them (the feed's free
+		// tier refuses callers who ask too often); ask only when we have none.
+		live.mutex.Lock()
+		fiatRates := live.fiatRates
+		live.mutex.Unlock()
+		if fiatRates == nil {
+			freshFiatRates, err := live.fetchFiatRates(requestContext)
+			if err != nil {
+				return fmt.Errorf("the fiat rates feed could not be reached, so %s could not be checked", assetCode)
+			}
+			fiatRates = freshFiatRates
+		}
+		if unitsPerDollar, found := fiatRates[assetCode]; !found || unitsPerDollar.Sign() <= 0 {
+			return fmt.Errorf("the fiat rates feed has no rate for %s", assetCode)
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown price source %q", priceSource)
 }
 
 // FetchPrices returns the live USD and NGN price of one whole unit of every
@@ -116,7 +180,7 @@ func (live *LiveRates) FetchPrices(requestContext context.Context, assetCodes []
 	// Which crypto assets we actually need to ask Coinbase about this time.
 	requestedCrypto := make([]string, 0, len(assetCodes))
 	for _, assetCode := range assetCodes {
-		if cryptoAssetsFromCoinbase[assetCode] {
+		if live.priceSourceOf(assetCode) == PriceSourceCoinbase {
 			requestedCrypto = append(requestedCrypto, assetCode)
 		}
 	}
@@ -202,9 +266,9 @@ func (live *LiveRates) pricesFromCache(assetCodes []string, now time.Time) (map[
 		switch {
 		case assetCode == "NGN":
 			// handled as the rail below
-		case stablecoinAssets[assetCode]:
+		case live.priceSourceOf(assetCode) == PriceSourceUsdPeg:
 			usdPerUnit[assetCode] = big.NewRat(1, 1)
-		case cryptoAssetsFromCoinbase[assetCode]:
+		case live.priceSourceOf(assetCode) == PriceSourceCoinbase:
 			cached, found := live.cryptoPrices[assetCode]
 			if !found || now.Sub(cached.fetchedAt) > cryptoReuseLimit {
 				return nil, fmt.Errorf("live rates: no %s price newer than %s", assetCode, cryptoReuseLimit)

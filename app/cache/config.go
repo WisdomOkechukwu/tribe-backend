@@ -12,7 +12,8 @@ import (
 )
 
 // configVersionKey is a Redis counter that goes up every time an admin
-// changes a fee, a margin or a provider (or the seeder changes assets).
+// changes a fee, a margin, a provider or a service switch (or the seeder
+// changes assets).
 const configVersionKey = "config:version"
 
 // configCheckEvery is how often a program asks Redis whether the
@@ -28,8 +29,9 @@ const configMaximumAge = 30 * time.Second
 const configRefreshAnyway = 5 * time.Minute
 
 // ConfigSnapshot is one consistent copy of the small, rarely-changing
-// tables every money request reads: assets, providers, rate margins and
-// active fee rules. Treat it as READ-ONLY: it is shared by every request.
+// tables every money request reads: assets, providers, rate margins,
+// active fee rules and the service switches. Treat it as READ-ONLY: it is
+// shared by every request.
 //
 // Deliberately NOT here: exchange_rate_latest (prices change every 10
 // seconds and quotes check how old they are) and anything about balances,
@@ -39,6 +41,7 @@ type ConfigSnapshot struct {
 	Providers map[string]models.Provider       // by id
 	Margins   map[string]models.RateMargin     // by asset code
 	Fees      map[string]models.TransactionFee // ACTIVE rules, by transaction type
+	Services  map[string]models.Service        // on/off switches, by service code (no row = enabled)
 }
 
 // ConfigCache keeps one ConfigSnapshot per program (API server, worker,
@@ -116,11 +119,12 @@ func (configCache *ConfigCache) ConfigChanged(requestContext context.Context) {
 	configCache.mutex.Unlock()
 }
 
-// loadConfigSnapshot reads the four configuration tables from MySQL.
+// loadConfigSnapshot reads the five configuration tables from MySQL.
 func loadConfigSnapshot(query *gorm.DB) (*ConfigSnapshot, error) {
 	snapshot := &ConfigSnapshot{
 		Assets: map[string]models.Asset{}, Providers: map[string]models.Provider{},
 		Margins: map[string]models.RateMargin{}, Fees: map[string]models.TransactionFee{},
+		Services: map[string]models.Service{},
 	}
 	var assets []models.Asset
 	if err := query.Find(&assets).Error; err != nil {
@@ -149,6 +153,13 @@ func loadConfigSnapshot(query *gorm.DB) (*ConfigSnapshot, error) {
 	}
 	for _, fee := range fees {
 		snapshot.Fees[fee.TransactionType] = fee
+	}
+	var serviceRows []models.Service
+	if err := query.Find(&serviceRows).Error; err != nil {
+		return nil, err
+	}
+	for _, serviceRow := range serviceRows {
+		snapshot.Services[serviceRow.Code] = serviceRow
 	}
 	return snapshot, nil
 }

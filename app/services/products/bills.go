@@ -105,6 +105,11 @@ func (service *Service) PayBill(requestContext context.Context, actor shared.Act
 	if err := service.database.WithContext(requestContext).Where("id = ? AND enabled = ?", input.BillerID, true).Take(&biller).Error; err != nil {
 		return nil, apperrors.NotFound("Biller")
 	}
+	// Each biller category (airtime, data, electricity, tv) is a service an
+	// admin can switch off. Checked here, before anything is priced or taken.
+	if err := shared.RequireBillService(service.database.WithContext(requestContext), biller.Category); err != nil {
+		return nil, err
+	}
 	amountNgn, err := money.ParseDecimal(input.AmountNgn, 2)
 	if err != nil || !amountNgn.IsPositive() {
 		return nil, apperrors.Validation(map[string][]string{"amount_ngn": {"Enter a valid amount."}})
@@ -283,11 +288,15 @@ func (service *Service) ListRecurring(requestContext context.Context, userID str
 //  3. write the change and bump the version.
 //
 // Changing what gets paid (amount, wallet, frequency) or switching a schedule
-// back on is new consent to future payments, so it needs the PIN again.
-// Pausing (active=false) does not.
+// back on is new consent to future payments, so it needs the PIN again,
+// and it is refused while an admin has recurring bills switched off.
+// Pausing (active=false) needs neither: a customer can always stop a schedule.
 func (service *Service) UpdateRecurring(requestContext context.Context, userID string, scheduleID string, pin string, input RecurringInput) (*models.RecurringBill, error) {
 	turningOn := input.Active != nil && *input.Active
 	if input.AmountNgn != "" || input.PayWith != "" || input.Frequency != "" || turningOn {
+		if err := shared.RequireService(service.database.WithContext(requestContext), shared.ServiceRecurringBills); err != nil {
+			return nil, err
+		}
 		if err := service.auth.VerifyPin(requestContext, userID, pin); err != nil {
 			return nil, err
 		}
@@ -337,6 +346,11 @@ func (service *Service) DeleteRecurring(requestContext context.Context, userID s
 // RunDueRecurringBills pays every schedule that is due (called by cron at 07:00).
 // Each schedule is claimed with an UPDATE that moves next_run_at forward;
 // only the scheduler whose UPDATE changed the row pays it (no double payment).
+//
+// When an admin has switched off recurring bills, or the bill's own service
+// (airtime, data, ...), that run is skipped like any other failed payment:
+// last_result says why, the customer gets an inbox message with the admin's
+// message, and the schedule tries again on its next date.
 func (service *Service) RunDueRecurringBills(requestContext context.Context) (paid int, skipped int, err error) {
 	var due []models.RecurringBill
 	if err := service.database.WithContext(requestContext).Where("active = ? AND next_run_at <= ?", true, time.Now().UTC()).Limit(500).Find(&due).Error; err != nil {
@@ -356,17 +370,27 @@ func (service *Service) RunDueRecurringBills(requestContext context.Context) (pa
 		if schedule.PlanID != nil {
 			planID = *schedule.PlanID
 		}
-		_, payError := service.PayBill(requestContext, shared.Actor{UserID: schedule.UserID}, PayBillInput{
-			BillerID: schedule.BillerID, Target: schedule.Target, PlanID: planID, AmountNgn: amount.Decimal(2),
-			PayWith: schedule.PayWithAsset, Reference: reference, SkipPin: true,
-		})
+		// Recurring bills as a whole can be switched off; PayBill then checks
+		// the bill's own service (its biller category).
+		payError := shared.RequireService(service.database.WithContext(requestContext), shared.ServiceRecurringBills)
+		if payError == nil {
+			_, payError = service.PayBill(requestContext, shared.Actor{UserID: schedule.UserID}, PayBillInput{
+				BillerID: schedule.BillerID, Target: schedule.Target, PlanID: planID, AmountNgn: amount.Decimal(2),
+				PayWith: schedule.PayWithAsset, Reference: reference, SkipPin: true,
+			})
+		}
 		result := "paid"
 		if payError != nil {
 			skipped++
 			result = "skipped: " + payError.Error()
+			body := "We couldn't pay your scheduled bill for " + schedule.Target + ". Top up and pay it now."
+			if appError := apperrors.As(payError); appError != nil && appError.Code == shared.CodeServiceDisabled {
+				// Not the customer's fault and topping up would not help: pass on the admin's message.
+				body = "We couldn't pay your scheduled bill for " + schedule.Target + ". " + appError.Message
+			}
 			service.database.WithContext(requestContext).Create(&models.InboxMessage{
 				ID: ids.New(), UserID: schedule.UserID, Kind: "money", Title: "Recurring bill skipped",
-				Body: "We couldn't pay your scheduled bill for " + schedule.Target + ". Top up and pay it now.", CreatedAt: time.Now().UTC(),
+				Body: body, CreatedAt: time.Now().UTC(),
 			})
 		} else {
 			paid++

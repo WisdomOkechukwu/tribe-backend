@@ -139,6 +139,35 @@ func (amount Amount) Decimal(decimalPlaces int) string {
 	return fmt.Sprintf("%s%s.%s", sign, digits[:splitAt], digits[splitAt:])
 }
 
+// Display returns the amount the way a person reads it in a message:
+// thousands grouped with commas, and no pointless zeros on the end of a coin
+// amount. Display(2) of 25000000 gives "250,000.00"; Display(8) of 500000
+// gives "0.005". Money with two decimals or fewer keeps them all ("1,250.00").
+// Use it for inbox and notification text only: JSON amounts stay Decimal.
+func (amount Amount) Display(decimalPlaces int) string {
+	plain := amount.Decimal(decimalPlaces)
+	sign := ""
+	if strings.HasPrefix(plain, "-") {
+		sign, plain = "-", plain[1:]
+	}
+	wholePart, fractionPart, _ := strings.Cut(plain, ".")
+	if decimalPlaces > 2 {
+		fractionPart = strings.TrimRight(fractionPart, "0")
+	}
+	// Walk the whole part from the left, adding a comma before every group of three digits.
+	var grouped strings.Builder
+	for position, digit := range wholePart {
+		if position > 0 && (len(wholePart)-position)%3 == 0 {
+			grouped.WriteByte(',')
+		}
+		grouped.WriteRune(digit)
+	}
+	if fractionPart == "" {
+		return sign + grouped.String()
+	}
+	return sign + grouped.String() + "." + fractionPart
+}
+
 // Add returns amount + other.
 func (amount Amount) Add(other Amount) Amount {
 	return Amount{units: new(big.Int).Add(amount.BigInt(), other.BigInt())}

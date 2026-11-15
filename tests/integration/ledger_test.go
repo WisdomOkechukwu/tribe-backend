@@ -2,7 +2,10 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
+	"math/big"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,34 +170,118 @@ func TestTreasuryFundingNeedsASecondAdmin(test *testing.T) {
 }
 
 // TestUsdToGbpUsesTheNgnRail: the seeded global provider has the rail ON,
-// so a USD -> GBP quote must go USD -> NGN -> GBP (two legs).
+// so a USD -> GBP quote must go USD -> NGN -> GBP (two hops). That routing
+// is ours to know: the quote we STORE records it, and the quote the app
+// RECEIVES shows one step, USD -> GBP, with no sign of Naira.
 func TestUsdToGbpUsesTheNgnRail(test *testing.T) {
 	environment := testenv.Start(test)
 	user := environment.RegisterUser(test, "railuser")
-	quote := user.Call(test, http.MethodPost, "/api/mobile/v1/quotes", map[string]string{
-		"transaction_type": "swap", "from_asset": "USD", "to_asset": "GBP", "amount": "20",
-	}, "")
-	var quoteData struct {
-		UsesNgnRail bool `json:"uses_ngn_rail"`
-		Route       []struct {
+	type quoteAnswer struct {
+		ID    string `json:"id"`
+		Route []struct {
 			FromAsset string `json:"from_asset"`
 			ToAsset   string `json:"to_asset"`
 		} `json:"route"`
 	}
-	quote.Decode(test, &quoteData)
-	if !quoteData.UsesNgnRail || len(quoteData.Route) != 2 ||
-		quoteData.Route[0].ToAsset != "NGN" || quoteData.Route[1].FromAsset != "NGN" {
-		test.Fatalf("USD -> GBP route = %+v, want USD -> NGN -> GBP", quoteData)
+	// storedHops reads the quote row as the server saved it: was the rail used, and how many hops.
+	storedHops := func(quoteID string) (bool, int) {
+		var stored models.Quote
+		if err := environment.App.Database.Where("id = ?", quoteID).Take(&stored).Error; err != nil {
+			test.Fatalf("read the stored quote: %v", err)
+		}
+		var hops []map[string]any
+		if err := json.Unmarshal(stored.Route, &hops); err != nil {
+			test.Fatalf("read the stored route: %v", err)
+		}
+		return stored.UsesNgnRail, len(hops)
 	}
 
-	// USDT -> USDC share the crypto provider with the rail OFF: one direct leg.
+	quote := user.Call(test, http.MethodPost, "/api/mobile/v1/quotes", map[string]string{
+		"transaction_type": "swap", "from_asset": "USD", "to_asset": "GBP", "amount": "20",
+	}, "")
+	var railQuote quoteAnswer
+	quote.Decode(test, &railQuote)
+	if usedRail, hops := storedHops(railQuote.ID); !usedRail || hops != 2 {
+		test.Fatalf("stored USD -> GBP quote: rail=%v hops=%d, want the rail with 2 hops", usedRail, hops)
+	}
+	if len(railQuote.Route) != 1 || railQuote.Route[0].FromAsset != "USD" || railQuote.Route[0].ToAsset != "GBP" {
+		test.Errorf("the app's USD -> GBP route = %+v, want one step USD -> GBP", railQuote.Route)
+	}
+	if body := string(quote.Data); strings.Contains(body, "ngn_rail") || strings.Contains(body, "NGN") {
+		test.Errorf("the app's quote reveals the Naira rail: %s", body)
+	}
+
+	// USDT -> USDC share the crypto provider with the rail OFF: one direct hop.
 	direct := user.Call(test, http.MethodPost, "/api/mobile/v1/quotes", map[string]string{
 		"transaction_type": "swap", "from_asset": "USDT", "to_asset": "USDC", "amount": "20",
 	}, "")
-	quoteData.Route = nil
-	direct.Decode(test, &quoteData)
-	if quoteData.UsesNgnRail || len(quoteData.Route) != 1 {
-		test.Fatalf("USDT -> USDC route = %+v, want one direct leg", quoteData)
+	var directQuote quoteAnswer
+	direct.Decode(test, &directQuote)
+	if usedRail, hops := storedHops(directQuote.ID); usedRail || hops != 1 {
+		test.Fatalf("stored USDT -> USDC quote: rail=%v hops=%d, want one direct hop", usedRail, hops)
+	}
+	if len(directQuote.Route) != 1 {
+		test.Errorf("the app's USDT -> USDC route = %+v, want one step", directQuote.Route)
+	}
+}
+
+// TestQuoteFromDollarAmount: a quote can be asked for in US dollars' worth
+// (usd_amount), the way the app's swap screen lets a user type it. The server
+// turns the dollars into the pay amount itself (market rate, rounded DOWN so
+// the user never pays more than they typed) and then prices it exactly like a
+// typed pay amount. Two amounts in one request are refused, because they
+// could disagree.
+func TestQuoteFromDollarAmount(test *testing.T) {
+	environment := testenv.Start(test)
+	user := environment.RegisterUser(test, "dollarquote")
+	type quoteAmounts struct {
+		FromAmount string `json:"from_amount"`
+		Fee        string `json:"fee"`
+		ToAmount   string `json:"to_amount"`
+	}
+	askForQuote := func(fromAsset string, toAsset string, amountField string, amount string) quoteAmounts {
+		response := user.Call(test, http.MethodPost, "/api/mobile/v1/quotes", map[string]string{
+			"transaction_type": "swap", "from_asset": fromAsset, "to_asset": toAsset, amountField: amount,
+		}, "")
+		if !response.Success {
+			test.Fatalf("quote %s -> %s with %s=%s: %d %s", fromAsset, toAsset, amountField, amount, response.Status, response.Message)
+		}
+		var amounts quoteAmounts
+		response.Decode(test, &amounts)
+		return amounts
+	}
+
+	// Paying in dollars: 20 dollars' worth IS 20 USD, so both ways of asking agree.
+	typedInDollars := askForQuote("USD", "GBP", "usd_amount", "20")
+	typedAsPayAmount := askForQuote("USD", "GBP", "amount", "20")
+	if typedInDollars != typedAsPayAmount {
+		test.Errorf("USD -> GBP: usd_amount gave %+v, amount gave %+v, want the same", typedInDollars, typedAsPayAmount)
+	}
+
+	// Paying in pounds: the pay amount is 20 dollars / (dollars per pound), rounded down to pence.
+	var poundRate models.ExchangeRateLatest
+	if err := environment.App.Database.Where("asset_code = ?", "GBP").Take(&poundRate).Error; err != nil {
+		test.Fatalf("read the GBP rate: %v", err)
+	}
+	dollarsPerPound, err := money.ParseRate(poundRate.UsdRate)
+	if err != nil {
+		test.Fatalf("parse the GBP rate: %v", err)
+	}
+	twentyDollars, _ := money.ParseDecimal("20", 2)
+	wantPounds := money.FromRational(new(big.Rat).Quo(twentyDollars.ToRational(2), dollarsPerPound), 2, money.RoundDown).Decimal(2)
+	poundsFromDollars := askForQuote("GBP", "USD", "usd_amount", "20")
+	if poundsFromDollars.FromAmount != wantPounds {
+		test.Errorf("GBP -> USD for 20 dollars' worth pays %s, want %s", poundsFromDollars.FromAmount, wantPounds)
+	}
+	if poundsTyped := askForQuote("GBP", "USD", "amount", wantPounds); poundsTyped != poundsFromDollars {
+		test.Errorf("GBP -> USD: usd_amount gave %+v, the same pounds typed gave %+v, want the same", poundsFromDollars, poundsTyped)
+	}
+
+	twoAmounts := user.Call(test, http.MethodPost, "/api/mobile/v1/quotes", map[string]string{
+		"transaction_type": "swap", "from_asset": "USD", "to_asset": "GBP", "amount": "20", "usd_amount": "20",
+	}, "")
+	if twoAmounts.Status != http.StatusUnprocessableEntity {
+		test.Errorf("two amounts in one quote gave %d, want 422", twoAmounts.Status)
 	}
 }
 

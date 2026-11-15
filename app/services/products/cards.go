@@ -492,7 +492,7 @@ func (service *Service) CreateCard(requestContext context.Context, actor shared.
 				return err
 			}
 		}
-		return shared.Notify(databaseTransaction, actor.UserID, "card", "Your card is ready", input.Label+" •• "+issued.LastFour+" has $"+topUp.Decimal(2), "/cards")
+		return shared.Notify(databaseTransaction, actor.UserID, "card", "Your card is ready", input.Label+" •• "+issued.LastFour+" has $"+topUp.Display(2), "/cards")
 	})
 	if err != nil {
 		return nil, nil, err

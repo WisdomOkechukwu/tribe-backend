@@ -18,6 +18,7 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/models"
 	"github.com/tribe-africa/tribe-backend/app/services/adminauth"
 	"github.com/tribe-africa/tribe-backend/app/services/ledger"
+	"github.com/tribe-africa/tribe-backend/app/services/providers"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/pkg/ids"
 )
@@ -32,6 +33,7 @@ func Run(requestContext context.Context, application *bootstrap.App) error {
 		{"company ledger accounts", seedCompanyAccounts},
 		{"rate margins and fees", seedPricing},
 		{"billers and gift card brands", seedCatalog},
+		{"service switches", seedServices},
 		{"card designs", seedCardDesigns},
 		{"first exchange rates", seedRates},
 		{"admin team", seedAdmins},
@@ -43,8 +45,8 @@ func Run(requestContext context.Context, application *bootstrap.App) error {
 			return err
 		}
 	}
-	// Assets, providers, margins and fees may have changed: tell every
-	// running program to reload its configuration copy.
+	// Assets, providers, margins, fees and service switches may have changed:
+	// tell every running program to reload its configuration copy.
 	application.Config.ConfigChanged(requestContext)
 	slog.Info("seeding done")
 	return nil
@@ -102,7 +104,16 @@ func seedProvidersAndAssets(requestContext context.Context, application *bootstr
 	}
 	providerAssets := []models.ProviderAsset{}
 	for index := range assets {
-		assets[index].DisplayOrder, assets[index].Enabled = index, true
+		assets[index].DisplayOrder, assets[index].Enabled, assets[index].Version = index, true, 1
+		// Where each one's live price comes from (an admin picks this when adding a currency later).
+		switch assets[index].Code {
+		case "USD", "USDT", "USDC":
+			assets[index].PriceSource = providers.PriceSourceUsdPeg
+		case "BTC", "ETH", "SOL":
+			assets[index].PriceSource = providers.PriceSourceCoinbase
+		default:
+			assets[index].PriceSource = providers.PriceSourceFiatFeed
+		}
 		assets[index].CreatedAt, assets[index].UpdatedAt = now, now
 		providerAssets = append(providerAssets, models.ProviderAsset{ProviderID: *assets[index].ConversionProviderID, AssetCode: assets[index].Code})
 	}
@@ -235,6 +246,21 @@ func seedCatalog(requestContext context.Context, application *bootstrap.App) err
 	return insertMissing(query, &rows)
 }
 
+// seedServices adds a switch row for every service in the catalog that has
+// none yet, switched ON. Rows that exist are left alone, so re-seeding never
+// overwrites an admin's choice (or their message).
+func seedServices(requestContext context.Context, application *bootstrap.App) error {
+	now := time.Now().UTC()
+	rows := make([]models.Service, 0, len(shared.ServiceCatalog))
+	for _, definition := range shared.ServiceCatalog {
+		rows = append(rows, models.Service{
+			Code: definition.Code, Name: definition.Name, Description: definition.Description,
+			Enabled: true, Version: 1, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	return insertMissing(application.Database.WithContext(requestContext), &rows)
+}
+
 // seedCardDesigns stores the card looks from the app (themes, colours, patterns).
 func seedCardDesigns(requestContext context.Context, application *bootstrap.App) error {
 	now := time.Now().UTC()
@@ -280,10 +306,10 @@ const DemoPassword = "Tribe@2026"
 func seedAdmins(requestContext context.Context, application *bootstrap.App) error {
 	presets := map[string][]string{
 		"super_admin": adminauth.AllPermissions(),
-		"ops":         {"overview.view", "customers.view", "customers.pii", "customers.labels", "customers.freeze", "adjustments.request", "kyc.view", "kyc.media", "kyc.decide", "transactions.view", "currencies.view", "inventory.view", "inventory.topup", "markups.view", "support.view", "support.reply", "support.resolve", "support.simulate", "api.view", "api.bodies", "audit.view", "team.view", "ledger.view", "providers.view", "rates.view", "jobs.view"},
+		"ops":         {"overview.view", "customers.view", "customers.pii", "customers.labels", "customers.freeze", "adjustments.request", "kyc.view", "kyc.media", "kyc.decide", "transactions.view", "currencies.view", "inventory.view", "inventory.topup", "markups.view", "support.view", "support.reply", "support.resolve", "support.simulate", "api.view", "api.bodies", "audit.view", "team.view", "ledger.view", "providers.view", "services.view", "rates.view", "jobs.view"},
 		"support":     {"overview.view", "customers.view", "customers.labels", "kyc.view", "transactions.view", "currencies.view", "support.view", "support.reply", "support.resolve", "support.simulate", "api.view"},
 		"compliance":  {"overview.view", "customers.view", "customers.pii", "customers.labels", "customers.freeze", "kyc.view", "kyc.media", "kyc.decide", "transactions.view", "api.view", "api.bodies", "audit.view", "team.view"},
-		"finance":     {"overview.view", "transactions.view", "currencies.view", "inventory.view", "inventory.topup", "inventory.approve", "adjustments.request", "markups.view", "markups.edit", "audit.view", "ledger.view", "providers.view", "rates.view", "jobs.view"},
+		"finance":     {"overview.view", "transactions.view", "currencies.view", "inventory.view", "inventory.topup", "inventory.approve", "adjustments.request", "markups.view", "markups.edit", "audit.view", "ledger.view", "providers.view", "services.view", "rates.view", "jobs.view"},
 		"viewer":      {"overview.view", "customers.view", "transactions.view", "currencies.view", "inventory.view", "markups.view", "support.view"},
 	}
 	team := []struct{ name, email, role, color string }{

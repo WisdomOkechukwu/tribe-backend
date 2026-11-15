@@ -117,12 +117,12 @@ func (service *Service) ApproveCustomerAdjustment(requestContext context.Context
 			UsdValue: service.rates.UsdValueOf(databaseTransaction, asset.Code, amount, asset.DecimalPlaces),
 		}
 		legs := ledger.CustomerCreditLegs(expense.ID, userWallet.ID, amount)
-		inboxBody := amount.Decimal(asset.DecimalPlaces) + " " + asset.Code + " from Tribe was added to your wallet."
+		inboxBody := amount.Display(asset.DecimalPlaces) + " " + asset.Code + " from Tribe was added to your wallet."
 		if adjustment.Kind == models.AdjustmentDebit {
 			// ledger.Post refuses to take a user wallet below zero (INSUFFICIENT_FUNDS).
 			legs = ledger.CustomerDebitLegs(userWallet.ID, expense.ID, amount)
 			transaction.Type, transaction.Direction, transaction.Title = "adjustment", "out", "Adjustment by Tribe"
-			inboxBody = amount.Decimal(asset.DecimalPlaces) + " " + asset.Code + " was taken from your wallet by Tribe: " + adjustment.Reason
+			inboxBody = amount.Display(asset.DecimalPlaces) + " " + asset.Code + " was taken from your wallet by Tribe: " + adjustment.Reason
 		} else {
 			transaction.Type, transaction.Direction, transaction.Title = "deposit", "in", "Credit from Tribe"
 		}

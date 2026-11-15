@@ -69,6 +69,7 @@ Error:
 | 422 | Validation or business rule (`INSUFFICIENT_FUNDS`, `WRONG_PIN`, ...) |
 | 413 | `BODY_TOO_LARGE`: the body is over `REQUEST_BODY_MAX_BYTES` (256 KB), refused before it is read |
 | 429 | Too many requests / PIN locked. Sign-in allows 10 attempts per email per 15 minutes (admin: 5), password change 10 per user, PIN 5 then a lock. Attempts are counted **before** the password or PIN is checked, so parallel guesses cannot slip past the limit. |
+| 503 | `SERVICE_DISABLED`: an admin switched this service off (admin → Services). `message` is what the admin wrote for customers. Retrying does not help until it is switched back on; `GET /services` says which services are off |
 | 5xx | Our fault. Safe to retry **with the same Idempotency-Key**. |
 
 ## 4. Headers the mobile app sends
@@ -141,6 +142,8 @@ Swaps and cross-currency sends work in two steps:
 | Same provider, rail OFF | Direct: `USDT → USDC` |
 
 Every leg is saved in `swap_legs` with its rate. On the NGN rail the journal also records the Naira received and paid; the difference is posted to *FX Margin Revenue*.
+
+**The rail is internal.** The mobile API never shows it: a quote's `route` and a transaction's `route` are always ONE step, from the asset paid to the asset received, with the overall amounts and rate (`[{step, from_asset, to_asset, from_amount, to_amount, rate}]`), and `uses_ngn_rail` is not sent in quotes or in transaction `meta`. The hops, the Naira amounts and the switch stay visible in the admin API (`/admin-api/transactions/{id}`, `/admin-api/providers`).
 
 ## 8. Live rates (Server-Sent Events)
 
@@ -228,9 +231,10 @@ The app opens the stream only on screens that show rates (swap, send, card fundi
 | 🔑 `GET /wallets/{code}/receive` | – (placeholder account / address) |
 | 🔑 `GET /rates` | – |
 | 🔑 `GET /rates/stream` | SSE (§8) |
-| 🔑 `POST /quotes` | `{transaction_type: swap\|send, from_asset, to_asset, amount}` (what you pay) **or** `receive_amount` |
+| 🔑 `POST /quotes` | `{transaction_type: swap\|send, from_asset, to_asset}` plus exactly ONE amount, in the unit the user typed: `amount` (what you pay, fee included), `receive_amount` (what you get) or `usd_amount` (what you pay, as US dollars' worth: converted at the market rate and rounded down, then priced like `amount`). More than one → 422 |
 | 🔑 `GET /transactions` | `?category=&type=&asset=&card_id=&cursor=` |
-| 🔑 `GET /transactions/{id}` | – → `{transaction, route:[legs]}` |
+| 🔑 `GET /transactions/{id}` | – → `{transaction, route}` (`route` is one step: what was paid → what arrived) |
+| 🔑 `GET /services` | – → `[{code, enabled, message}]`: every service an admin can switch off (`swap`, `send_tribe`, `send_bank`, `send_global`, `send_crypto`, `bill_airtime`, `bill_data`, `bill_electricity`, `bill_tv`, `recurring_bills`, `gift_card_buy`, `gift_card_sell`, `virtual_cards`, `cashpoint_create`, `cashpoint_redeem`, `referral_withdraw`, `wallet_open`, `receive`). The app greys out what is off; the API refuses it with 503 `SERVICE_DISABLED` either way |
 
 ### Swap and send
 | Method & path | Body |
@@ -309,7 +313,9 @@ Sign in with `POST /admin-api/sessions {email, password}`, which returns `{admin
 | Free funds | `GET /free-funds` (inventory.view) → per currency `{asset_code, vault, owed, free}`. `free` = vault − what customers are owed (wallets, referral and card balances, cashpoint escrow, payouts and purchases in transit). It is the most admins can credit, and may be negative. Every currency is computed with a fixed number of queries (`ledger.FreeFundsForAssets`), giving the same numbers as `ledger.FreeFundsOf` one currency at a time. |
 | Manual credits & debits | `POST /customers/{id}/adjustments {kind: credit\|debit, asset, amount, reason}` creates a **pending** request (adjustments.request) · `GET /customer-adjustments?status=&kind=&customer=&page=` (inventory.view; rows have `amount_decimal`, `customer_name`, `customer_tag`) · `POST /customer-adjustments/{id}/approve` and `POST /customer-adjustments/{id}/reject {reason}` (adjustments.approve **and** a super admin, i.e. every permission: `403 SUPER_ADMIN_REQUIRED`). Never your own (`403 FOUR_EYES_REQUIRED`). A credit bigger than the free funds is refused with `422 INSUFFICIENT_FREE_FUNDS`, a debit bigger than the wallet with `422 INSUFFICIENT_FUNDS`, both at request time and again at approval. Deciding twice returns `409 ALREADY_DECIDED`. |
 | Ledger | `GET /ledger-accounts?owner=company\|<user id>&asset=`, `GET /ledger-accounts/{id}/legs`, `GET /journal-entries/{id}`, `GET /ledger-snapshots?date=`, `GET /ledger/verify[?full=true]` (ledger.view): by default checks only what changed since the last clean check (`mode: incremental`); `full=true` re-proves the whole ledger. Returns `{ok, mode, problems (first 1000), problem_count, entries_checked, snapshots_checked}` |
+| Currencies | `GET /currencies` (currencies.view) → every asset incl. `price_source`, `enabled`, `version` · `POST /currencies {code, name, kind: fiat\|crypto, symbol?, decimal_places (0–8), conversion_provider_id, price_source: fiat_feed\|coinbase\|usd_peg}` (currencies.manage): adds a currency **switched off**, with its margin row, provider link and every company ledger account; 409 `CURRENCY_EXISTS`; 422 when the price source cannot price that code · `PUT /currencies/{code} {name?, symbol?, display_order?, enabled?, version}` (currencies.manage): switching ON first makes sure the ledger accounts exist and a live price can be fetched (422 `CURRENCY_NOT_PRICED`); NGN and USD cannot be switched off (422 `CURRENCY_ALWAYS_ON`). Code, kind and decimal places never change |
 | Providers | `GET /providers` (providers.view) · `PUT /providers/{id} {uses_ngn_rail?, supports_direct_conversion?, enabled?, version}` (providers.manage) |
+| Services | `GET /services` (services.view) → every service with `{code, name, description, enabled, disabled_message, version}` · `PUT /services/{code} {enabled?, disabled_message?, version}` (services.manage): switches a customer-facing service off or on within about a second; `disabled_message` is shown in the app while it is off (empty = a default). Cancelling a cashpoint, deleting a card and settling or refunding payments already under way are never switched off |
 | Card designs | All need card_designs.manage. `GET /card-designs` → `{themes, swatches, patterns}`, disabled ones included, ordered by `sort_order` then `name` · `POST /card-designs {id, kind: theme\|swatch\|pattern, name, finish?, hex_color?, pattern?, enabled, sort_order}` → `201` with the row. `id` is kept as sent (2–48 characters like `theme-midnight`, `swatch-FF7A5C`, `pattern-dots`); a taken id, or the same look as another design of that kind (same theme `finish`, same `hex_color`, same `pattern`), is `409 DESIGN_EXISTS` · `PUT /card-designs/{id} {kind, name, finish?, hex_color?, pattern?, enabled, sort_order, version}` → the row; `version` (1 or more) must be the current one (`409 STALE_DATA`; `422` for 0; `404` for an unknown id) · `DELETE /card-designs/{id}?version=N` turns it off, `POST /card-designs/{id}/enable {version}` turns it back on; both need the current version, bump it and return the row. Per kind: a theme needs `finish` (lowercase letters), a swatch `hex_color` (6 hex digits, stored upper case), a pattern `pattern` (lowercase letters); `sort_order` is 0–10000; fields of other kinds are stored empty (`422 VALIDATION_FAILED` with `errors.finish`, `hex_color`, `pattern`, `sort_order` or `id`). Turning a design off only stops NEW picks: cards already wearing it keep it. The app may pick a bare theme (`sunset`, needs only that theme enabled), `theme:pattern` (needs both) or `custom:RRGGBB[:pattern]` (needs the pattern, `plain` when left out; any colour) |
 | Support | `GET /support-threads?status=&channel=` (`meta.counts` = `{open, pending, resolved}`), `GET /support-threads/{id}` (support.view) · `GET /support-threads/stream`: **live inbox over SSE**. It sends `event: support` with `data: {"type":"ticket.new\|thread.updated\|thread.status\|...","thread_id":"..."}` on every change, plus a heartbeat every 15 s. Reload the thread when an event arrives. · `POST /support-threads/{id}/messages` (support.reply) · `PATCH /support-threads/{id}/status` (support.resolve) |
 | Logs | `GET /api-requests?customer_id=&status=2xx\|4xx\|5xx&method=&path=&min_latency=` (api.view; bodies hidden without api.bodies) · `GET /audit-logs?action=` (audit.view) |
@@ -354,7 +360,7 @@ curl -X POST localhost:8080/webhooks/global-simulator -H "X-Tribe-Signature: $SI
 # 1. price it (locked for 30 s)
 curl -X POST $API/api/mobile/v1/quotes -H "Authorization: Bearer $TOKEN" -H "X-Device-Imei: $PHONE" \
   -H 'Content-Type: application/json' -d '{"transaction_type":"swap","from_asset":"USD","to_asset":"GBP","amount":"20"}'
-# -> data.id = quote id, data.route = USD->NGN, NGN->GBP (NGN rail)
+# -> data.id = quote id, data.route = one step USD->GBP (the Naira rail stays on the server)
 
 # 2. confirm it (the PIN is checked, the quote is used once, the journal is posted)
 curl -X POST $API/api/mobile/v1/swaps -H "Authorization: Bearer $TOKEN" -H "X-Device-Imei: $PHONE" \

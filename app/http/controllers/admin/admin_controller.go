@@ -358,6 +358,42 @@ func (controller *Controller) Currencies(httpContext *gin.Context) {
 	responses.OK(httpContext, "Currencies loaded.", assets)
 }
 
+// CreateCurrency  POST /admin-api/currencies  -> a new currency, switched off
+// (409 CURRENCY_EXISTS when the code is taken).
+func (controller *Controller) CreateCurrency(httpContext *gin.Context) {
+	var input requests.CurrencyCreateRequest
+	if err := requests.Bind(httpContext, &input); err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	asset, err := controller.application.Backoffice.CreateCurrency(httpContext.Request.Context(), middleware.CurrentAdmin(httpContext), backoffice.CurrencyInput{
+		Code: input.Code, Name: input.Name, Kind: input.Kind, Symbol: input.Symbol, DecimalPlaces: *input.DecimalPlaces,
+		ConversionProviderID: input.ConversionProviderID, PriceSource: input.PriceSource,
+	})
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	responses.Created(httpContext, "Currency added. Switch it on when you are ready.", asset)
+}
+
+// UpdateCurrency  PUT /admin-api/currencies/:code  -> rename, reorder, or switch a currency on or off
+func (controller *Controller) UpdateCurrency(httpContext *gin.Context) {
+	var input requests.CurrencyUpdateRequest
+	if err := requests.Bind(httpContext, &input); err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	asset, err := controller.application.Backoffice.UpdateCurrency(httpContext.Request.Context(), middleware.CurrentAdmin(httpContext), httpContext.Param("code"), backoffice.CurrencyChanges{
+		Name: input.Name, Symbol: input.Symbol, DisplayOrder: input.DisplayOrder, Enabled: input.Enabled, Version: input.Version,
+	})
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	responses.OK(httpContext, "Currency saved.", asset)
+}
+
 // Rates  GET /admin-api/rates
 func (controller *Controller) Rates(httpContext *gin.Context) {
 	event, err := controller.application.Rates.LatestEvent(httpContext.Request.Context())
@@ -653,7 +689,7 @@ func (controller *Controller) VerifyLedger(httpContext *gin.Context) {
 	})
 }
 
-// ─── Providers and card designs ──────────────────────────────────────
+// ─── Providers, services and card designs ────────────────────────────
 
 // Providers  GET /admin-api/providers
 func (controller *Controller) Providers(httpContext *gin.Context) {
@@ -680,6 +716,33 @@ func (controller *Controller) UpdateProvider(httpContext *gin.Context) {
 		return
 	}
 	responses.OK(httpContext, "Provider saved.", provider)
+}
+
+// Services  GET /admin-api/services  -> every customer-facing service with its on/off switch
+func (controller *Controller) Services(httpContext *gin.Context) {
+	list, err := controller.application.Backoffice.ListServices(httpContext.Request.Context())
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	responses.OK(httpContext, "Services loaded.", list)
+}
+
+// UpdateService  PUT /admin-api/services/:code  -> switch a service on or off, or change its message
+func (controller *Controller) UpdateService(httpContext *gin.Context) {
+	var input requests.ServiceRequest
+	if err := requests.Bind(httpContext, &input); err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	serviceSwitch, err := controller.application.Backoffice.UpdateService(httpContext.Request.Context(), middleware.CurrentAdmin(httpContext), httpContext.Param("code"), backoffice.ServiceChanges{
+		Enabled: input.Enabled, DisabledMessage: input.DisabledMessage, Version: input.Version,
+	})
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	responses.OK(httpContext, "Service saved.", serviceSwitch)
 }
 
 // CardDesigns  GET /admin-api/card-designs

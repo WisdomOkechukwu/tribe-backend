@@ -20,7 +20,6 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/app/services/swaps"
 	"github.com/tribe-africa/tribe-backend/app/services/transfers"
-	"github.com/tribe-africa/tribe-backend/pkg/money"
 )
 
 // MoneyController handles wallets, rates, quotes, swaps, sends and the activity list.
@@ -79,6 +78,17 @@ func (controller *MoneyController) ReceiveDetails(httpContext *gin.Context) {
 		return
 	}
 	responses.OK(httpContext, "Receive details loaded.", details)
+}
+
+// Services  GET /services  -> every service with its on/off switch and, when
+// it is off, the admin's message, so the app can grey it out.
+func (controller *MoneyController) Services(httpContext *gin.Context) {
+	statuses, err := shared.ServiceStatuses(controller.application.Database.WithContext(httpContext.Request.Context()))
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	responses.OK(httpContext, "Services loaded.", statuses)
 }
 
 // Rates  GET /rates  -> all rates now (first load, or when the stream is down).
@@ -146,6 +156,7 @@ func (controller *MoneyController) RatesStream(httpContext *gin.Context) {
 }
 
 // CreateQuote  POST /quotes  -> a price locked for 30 seconds.
+// 503 SERVICE_DISABLED when the swap or send it is for is switched off.
 func (controller *MoneyController) CreateQuote(httpContext *gin.Context) {
 	var input requests.QuoteRequest
 	if err := requests.Bind(httpContext, &input); err != nil {
@@ -154,25 +165,25 @@ func (controller *MoneyController) CreateQuote(httpContext *gin.Context) {
 	}
 	quote, price, err := controller.application.Rates.CreateQuote(httpContext.Request.Context(), middleware.CurrentActor(httpContext).UserID, rates.PriceInput{
 		TransactionType: input.TransactionType, FromAsset: input.FromAsset, ToAsset: input.ToAsset,
-		PayAmount: input.Amount, ReceiveAmount: input.ReceiveAmount,
+		PayAmount: input.Amount, ReceiveAmount: input.ReceiveAmount, UsdAmount: input.UsdAmount,
 	})
 	if err != nil {
 		responses.Error(httpContext, err)
 		return
 	}
+	// The app is shown ONE step, from the asset paid to the asset received.
+	// price.Route (which may go through Naira) is saved on the quote for the
+	// swap itself and for the admin panel, and never sent to the phone.
 	decimals := controller.decimals(httpContext)
-	route := make([]resources.SwapLegResource, 0, len(price.Route))
-	for _, leg := range price.Route {
-		fromAmount, _ := money.ParseUnits(leg.FromAmount)
-		toAmount, _ := money.ParseUnits(leg.ToAmount)
-		route = append(route, resources.SwapLegResource{Step: leg.Step, FromAsset: leg.FromAsset, ToAsset: leg.ToAsset,
-			FromAmount: fromAmount.Decimal(decimals[leg.FromAsset]), ToAmount: toAmount.Decimal(decimals[leg.ToAsset]), Rate: leg.Rate, ViaNgnRail: leg.ViaNgnRail})
-	}
 	responses.Created(httpContext, "Here's your price.", resources.QuoteResource{
 		ID: quote.ID, FromAsset: quote.FromAsset, ToAsset: quote.ToAsset,
 		FromAmount: price.TotalPaid.Decimal(decimals[quote.FromAsset]), Fee: price.Fee.Decimal(decimals[quote.FromAsset]),
 		ToAmount: price.Received.Decimal(decimals[quote.ToAsset]), Rate: price.Rate.FloatString(8),
-		UsesNgnRail: quote.UsesNgnRail, Route: route, ExpiresAt: quote.ExpiresAt,
+		Route: []resources.RouteLegResource{{
+			Step: 1, FromAsset: quote.FromAsset, ToAsset: quote.ToAsset,
+			FromAmount: price.Converted.Decimal(decimals[quote.FromAsset]), ToAmount: price.Received.Decimal(decimals[quote.ToAsset]), Rate: quote.Rate,
+		}},
+		ExpiresAt: quote.ExpiresAt,
 	})
 }
 
@@ -290,13 +301,14 @@ func (controller *MoneyController) Transactions(httpContext *gin.Context) {
 	responses.OKWithMeta(httpContext, "Transactions loaded.", resources.Transactions(transactions, controller.decimals(httpContext)), responses.Pagination{NextCursor: nextCursor})
 }
 
-// Transaction  GET /transactions/:id  -> one transaction with its route legs (receipt).
+// Transaction  GET /transactions/:id  -> one transaction with its route (receipt).
+// The route is the conversion as the customer did it, in one step (see resources.CustomerRoute).
 func (controller *MoneyController) Transaction(httpContext *gin.Context) {
-	transaction, legs, err := controller.application.Account.Transaction(httpContext.Request.Context(), middleware.CurrentActor(httpContext).UserID, httpContext.Param("id"))
+	transaction, legs, quotedRate, err := controller.application.Account.Transaction(httpContext.Request.Context(), middleware.CurrentActor(httpContext).UserID, httpContext.Param("id"))
 	if err != nil {
 		responses.Error(httpContext, err)
 		return
 	}
 	decimals := controller.decimals(httpContext)
-	responses.OK(httpContext, "Transaction loaded.", gin.H{"transaction": resources.Transaction(*transaction, decimals), "route": resources.SwapLegs(legs, decimals)})
+	responses.OK(httpContext, "Transaction loaded.", gin.H{"transaction": resources.Transaction(*transaction, decimals), "route": resources.CustomerRoute(legs, quotedRate, decimals)})
 }

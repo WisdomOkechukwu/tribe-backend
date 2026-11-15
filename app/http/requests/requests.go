@@ -204,13 +204,16 @@ type KycRequest struct {
 
 // ─── Mobile: money ───────────────────────────────────────────────────
 
-// QuoteRequest asks for a price. Send amount (what you pay) OR receive_amount.
+// QuoteRequest asks for a price. Send exactly ONE amount, in the unit the
+// user typed it in: amount (what you pay), receive_amount (what you get) or
+// usd_amount (what you pay, as US dollars' worth).
 type QuoteRequest struct {
 	TransactionType string `json:"transaction_type" binding:"required,oneof=swap send"`
 	FromAsset       string `json:"from_asset" binding:"required,max=10"`
 	ToAsset         string `json:"to_asset" binding:"required,max=10"`
 	Amount          string `json:"amount" binding:"max=40"`
 	ReceiveAmount   string `json:"receive_amount" binding:"max=40"`
+	UsdAmount       string `json:"usd_amount" binding:"max=40"`
 }
 
 // SwapRequest confirms a swap.
@@ -447,6 +450,40 @@ type ProviderRequest struct {
 	SupportsDirectConversion *bool `json:"supports_direct_conversion"`
 	Enabled                  *bool `json:"enabled"`
 	Version                  int   `json:"version"`
+}
+
+// CurrencyCreateRequest adds a currency or coin. It is created switched off;
+// an admin switches it on afterwards (CurrencyUpdateRequest).
+type CurrencyCreateRequest struct {
+	Code                 string `json:"code" binding:"required,max=10"`
+	Name                 string `json:"name" binding:"required,max=64"`
+	Kind                 string `json:"kind" binding:"required,oneof=fiat crypto"`
+	Symbol               string `json:"symbol" binding:"max=8"`
+	DecimalPlaces        *int   `json:"decimal_places" binding:"required,min=0,max=8"`
+	ConversionProviderID string `json:"conversion_provider_id" binding:"required,max=26"`
+	PriceSource          string `json:"price_source" binding:"required,oneof=fiat_feed coinbase usd_peg"`
+}
+
+// CurrencyUpdateRequest renames a currency, moves it in the list or switches
+// it on or off. A field that is left out is not changed. version is the one
+// the admin last saw (409 STALE_DATA if the row changed since).
+type CurrencyUpdateRequest struct {
+	Name         *string `json:"name" binding:"omitempty,max=64"`
+	Symbol       *string `json:"symbol" binding:"omitempty,max=8"`
+	DisplayOrder *int    `json:"display_order" binding:"omitempty,min=0"`
+	Enabled      *bool   `json:"enabled"`
+	Version      int     `json:"version" binding:"required,min=1"`
+}
+
+// ServiceRequest switches a customer-facing service on or off, and/or sets
+// the message the app shows while it is off. A field that is left out is
+// not changed; an empty disabled_message clears it (the app then shows a
+// default). version is the one the admin last saw (409 STALE_DATA if the
+// row changed since).
+type ServiceRequest struct {
+	Enabled         *bool   `json:"enabled"`
+	DisabledMessage *string `json:"disabled_message" binding:"omitempty,max=200"`
+	Version         int     `json:"version" binding:"required,min=1"`
 }
 
 // CardDesignRequest creates (POST) or updates (PUT) a card design.

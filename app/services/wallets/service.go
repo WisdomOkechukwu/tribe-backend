@@ -164,7 +164,7 @@ func (service *Service) TestTopUp(requestContext context.Context, actor shared.A
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
 			return err
 		}
-		return shared.Notify(databaseTransaction, actor.UserID, "money", "Money received", amount.Decimal(asset.DecimalPlaces)+" "+asset.Code+" added to your wallet.", "/transaction/"+transaction.ID)
+		return shared.Notify(databaseTransaction, actor.UserID, "money", "Money received", amount.Display(asset.DecimalPlaces)+" "+asset.Code+" added to your wallet.", "/transaction/"+transaction.ID)
 	})
 	if err != nil {
 		return nil, err

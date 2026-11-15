@@ -85,6 +85,29 @@ type PriceInput struct {
 	// Give EXACTLY ONE of these (as typed by the user, e.g. "25.50"):
 	PayAmount     string // "I want to pay this much (fee included)"
 	ReceiveAmount string // "I want to receive this much"
+	UsdAmount     string // "I want to pay this many US dollars' worth (fee included)"
+}
+
+// usdDecimalPlaces is how many decimal places a typed dollar amount may have (cents).
+const usdDecimalPlaces = 2
+
+// payAmountForUsd turns "I want to swap 25 dollars' worth" into an amount of
+// the asset being paid, so the phone never has to do this conversion itself.
+//
+// It uses the plain market price (usdPerUnit = dollars for one unit of the
+// asset), with no margin: the margin is applied afterwards, in the conversion
+// rate, exactly as it is for a typed pay amount. The result rounds DOWN, so
+// the user never pays more than the dollars they typed.
+func payAmountForUsd(usdAmountText string, usdPerUnit *big.Rat, decimalPlaces int) (money.Amount, error) {
+	usdAmount, err := money.ParseDecimal(usdAmountText, usdDecimalPlaces)
+	if err != nil {
+		return money.Zero(), err
+	}
+	if usdPerUnit == nil || usdPerUnit.Sign() <= 0 {
+		return money.Zero(), money.ErrInvalidAmount
+	}
+	payAmount := new(big.Rat).Quo(usdAmount.ToRational(usdDecimalPlaces), usdPerUnit)
+	return money.FromRational(payAmount, decimalPlaces, money.RoundDown), nil
 }
 
 // PriceConversion works out a full price. It never saves anything.
@@ -134,9 +157,29 @@ func (service *Service) PriceConversion(requestContext context.Context, input Pr
 
 	price := &Price{TransactionType: input.TransactionType, FromAsset: from, ToAsset: to, Rate: rate, UsesNgnRail: usesNgnRail}
 
+	// The phone sends the amount in the unit the user typed it in, and only
+	// that one: two amounts could disagree, and we would have to guess.
+	amountsGiven := 0
+	for _, amountText := range []string{input.PayAmount, input.ReceiveAmount, input.UsdAmount} {
+		if amountText != "" {
+			amountsGiven++
+		}
+	}
+	if amountsGiven > 1 {
+		return nil, apperrors.Validation(map[string][]string{"amount": {"Send only one of amount, receive_amount or usd_amount."}})
+	}
+
 	switch {
-	case input.PayAmount != "":
-		totalPaid, err := money.ParseDecimal(input.PayAmount, from.DecimalPlaces)
+	case input.PayAmount != "" || input.UsdAmount != "":
+		// A dollar amount is first turned into the pay amount, then priced
+		// exactly like a typed pay amount.
+		var totalPaid money.Amount
+		var err error
+		if input.PayAmount != "" {
+			totalPaid, err = money.ParseDecimal(input.PayAmount, from.DecimalPlaces)
+		} else {
+			totalPaid, err = payAmountForUsd(input.UsdAmount, market.usd[from.Code], from.DecimalPlaces)
+		}
 		if err != nil || !totalPaid.IsPositive() {
 			return nil, apperrors.Validation(map[string][]string{"amount": {"Enter a valid amount."}})
 		}
