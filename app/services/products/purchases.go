@@ -13,7 +13,6 @@ import (
 
 	"github.com/tribe-africa/tribe-backend/app/apperrors"
 	"github.com/tribe-africa/tribe-backend/app/models"
-	"github.com/tribe-africa/tribe-backend/app/services/ledger"
 	"github.com/tribe-africa/tribe-backend/app/services/providers"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/database"
@@ -169,12 +168,16 @@ func (service *Service) ProcessPurchase(requestContext context.Context, transact
 
 // settlePurchase records a confirmed purchase:
 //
-//	lock the transaction row -> still pending? -> post Dr Purchases In
-//	Transit / Cr Company Vault -> fill in the token or code -> completed
+//	lock the transaction row -> still pending? -> pay an inviter's share
+//	that waited for this answer -> fill in the token or code -> completed
 //	-> inbox message, all in one transaction.
 //
-// Locking order: the transaction row first, then ledger.Post locks the
-// ledger accounts in ascending id order (the same order as ProcessPayout).
+// The money already left the provider's vault when the purchase was posted,
+// so nothing else is posted here.
+//
+// Locking order: the transaction row first, then the referral earning, then
+// ledger.Post locks the ledger accounts in ascending id order (the same
+// order as ProcessPayout).
 func (service *Service) settlePurchase(requestContext context.Context, transactionID string, details purchaseDetails, outcome purchaseOutcome) error {
 	var encryptedCode []byte
 	if outcome.giftCode != "" {
@@ -191,19 +194,7 @@ func (service *Service) settlePurchase(requestContext context.Context, transacti
 		if locked.Status != models.TransactionStatusPending {
 			return nil // another worker finished it while we waited for the provider
 		}
-		inTransit, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodePurchaseInTransit, outcome.settledAsset)
-		if err != nil {
-			return err
-		}
-		vault, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCompanyVault, outcome.settledAsset)
-		if err != nil {
-			return err
-		}
-		if _, err := service.ledger.Post(databaseTransaction, ledger.Entry{
-			Reference: locked.Reference + ":SETTLE", TransactionType: locked.Type + "_settled", Description: locked.Title + " confirmed by provider",
-			CreatedBy: "system", BusinessTransactionID: &locked.ID,
-			Legs: ledger.PurchaseSucceededLegs(inTransit.ID, vault.ID, outcome.settledAmount),
-		}); err != nil {
+		if err := service.referrals.PayAccrued(databaseTransaction, locked.ID); err != nil {
 			return err
 		}
 
@@ -252,8 +243,10 @@ func (service *Service) settlePurchase(requestContext context.Context, transacti
 }
 
 // refundPurchase records a purchase the provider REFUSED: the original
-// posting is reversed (the customer gets back exactly what they paid, fee
-// included), the purchase is marked failed, and the customer is told.
+// posting is reversed (the money goes back into the provider's vault and
+// the customer gets back exactly what they paid, fee included), an
+// inviter's share waiting for this answer is cancelled, the purchase is
+// marked failed, and the customer is told.
 func (service *Service) refundPurchase(requestContext context.Context, transactionID string, reason string) error {
 	return database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
 		var locked models.Transaction
@@ -267,6 +260,9 @@ func (service *Service) refundPurchase(requestContext context.Context, transacti
 			return fmt.Errorf("purchase %s has no journal entry to reverse", locked.ID)
 		}
 		if _, err := service.ledger.Reverse(databaseTransaction, *locked.JournalEntryID, "provider refused: "+reason, "system"); err != nil {
+			return err
+		}
+		if err := service.referrals.Cancel(databaseTransaction, locked.ID); err != nil {
 			return err
 		}
 		now := time.Now().UTC()

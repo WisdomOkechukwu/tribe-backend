@@ -12,7 +12,7 @@ import (
 )
 
 // configVersionKey is a Redis counter that goes up every time an admin
-// changes a fee, a margin, a provider or a service switch (or the seeder
+// changes a fee, a margin, the referral share, a provider or a service switch (or the seeder
 // changes assets).
 const configVersionKey = "config:version"
 
@@ -30,7 +30,7 @@ const configRefreshAnyway = 5 * time.Minute
 
 // ConfigSnapshot is one consistent copy of the small, rarely-changing
 // tables every money request reads: assets, providers, rate margins,
-// active fee rules and the service switches. Treat it as READ-ONLY: it is
+// active fee rules, the service switches and the referral share. Treat it as READ-ONLY: it is
 // shared by every request.
 //
 // Deliberately NOT here: exchange_rate_latest (prices change every 10
@@ -42,6 +42,7 @@ type ConfigSnapshot struct {
 	Margins   map[string]models.RateMargin     // by asset code
 	Fees      map[string]models.TransactionFee // ACTIVE rules, by transaction type
 	Services  map[string]models.Service        // on/off switches, by service code (no row = enabled)
+	Referral  models.ReferralSettings          // the share of earnings paid to an inviter
 }
 
 // ConfigCache keeps one ConfigSnapshot per program (API server, worker,
@@ -119,7 +120,7 @@ func (configCache *ConfigCache) ConfigChanged(requestContext context.Context) {
 	configCache.mutex.Unlock()
 }
 
-// loadConfigSnapshot reads the five configuration tables from MySQL.
+// loadConfigSnapshot reads the six configuration tables from MySQL.
 func loadConfigSnapshot(query *gorm.DB) (*ConfigSnapshot, error) {
 	snapshot := &ConfigSnapshot{
 		Assets: map[string]models.Asset{}, Providers: map[string]models.Provider{},
@@ -160,6 +161,15 @@ func loadConfigSnapshot(query *gorm.DB) (*ConfigSnapshot, error) {
 	}
 	for _, serviceRow := range serviceRows {
 		snapshot.Services[serviceRow.Code] = serviceRow
+	}
+	// One row (id 1). If it is missing, the share is zero: nothing is paid.
+	snapshot.Referral = models.ReferralSettings{ID: 1, SharePercent: "0"}
+	var referral models.ReferralSettings
+	err := query.Where("id = ?", 1).Take(&referral).Error
+	if err == nil {
+		snapshot.Referral = referral
+	} else if err != gorm.ErrRecordNotFound {
+		return nil, err
 	}
 	return snapshot, nil
 }

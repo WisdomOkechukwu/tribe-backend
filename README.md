@@ -56,7 +56,7 @@ make try                      # guided curl tour: sign-up, top-up, NGN-rail swap
 **Local conveniences** (only when `APP_ENV=local`):
 
 - The API returns `debug_code` for email and new-phone codes, and the worker prints the "email" to its log.
-- Customers get money from admins: `POST /admin-api/customers/{id}/adjustments` (credit or debit), approved by a super admin, limited by the vault's free funds (`GET /admin-api/free-funds`). The seeders still give demo customers test money.
+- Customers get money from admins: `POST /admin-api/customers/{id}/adjustments` (credit or debit), approved by a super admin, paid from the currency's Tribe Funds (`GET /admin-api/free-funds` shows `tribe_funds`). The seeders still give demo customers test money.
 
 ## Connect the apps
 

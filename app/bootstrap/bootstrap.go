@@ -25,6 +25,7 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/services/products"
 	"github.com/tribe-africa/tribe-backend/app/services/providers"
 	"github.com/tribe-africa/tribe-backend/app/services/rates"
+	"github.com/tribe-africa/tribe-backend/app/services/referrals"
 	"github.com/tribe-africa/tribe-backend/app/services/security"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/app/services/swaps"
@@ -54,6 +55,7 @@ type App struct {
 	AdminAuth   *adminauth.Service
 	Idempotency *idempotency.Service
 	Wallets     *wallets.Service
+	Referrals   *referrals.Service
 	Swaps       *swaps.Service
 	Transfers   *transfers.Service
 	Products    *products.Service
@@ -101,9 +103,10 @@ func New(settings config.Config) (*App, error) {
 	application.AdminAuth = adminauth.NewService(connection, redisClient, application.Toolkit, settings)
 	application.Idempotency = idempotency.NewService(connection)
 	application.Wallets = wallets.NewService(connection, application.Ledger, application.Rates, settings)
-	application.Swaps = swaps.NewService(connection, application.Ledger, application.Rates, application.Auth, application.Dispatcher)
-	application.Transfers = transfers.NewService(connection, application.Ledger, application.Rates, application.Auth, application.Providers, application.Dispatcher)
-	application.Products = products.NewService(connection, application.Ledger, application.Rates, application.Auth, application.Providers, application.Dispatcher, application.Toolkit, settings)
+	application.Referrals = referrals.NewService(connection, application.Ledger, application.Config)
+	application.Swaps = swaps.NewService(connection, application.Ledger, application.Rates, application.Auth, application.Referrals, application.Dispatcher)
+	application.Transfers = transfers.NewService(connection, application.Ledger, application.Rates, application.Auth, application.Providers, application.Referrals, application.Dispatcher)
+	application.Products = products.NewService(connection, application.Ledger, application.Rates, application.Auth, application.Providers, application.Referrals, application.Dispatcher, application.Toolkit, settings)
 	application.Account = account.NewService(connection, redisClient, application.Toolkit, application.Dispatcher, settings)
 	application.Webhooks = webhooks.NewService(connection, application.Dispatcher, settings)
 	application.ApiTrail = apitrail.NewWriter(connection)

@@ -422,16 +422,23 @@ type TransactionFeeRequest struct {
 	Version      int     `json:"version"`
 }
 
+// ReferralSettingsRequest changes the referral share.
+type ReferralSettingsRequest struct {
+	SharePercent string `json:"share_percent" binding:"required,max=12"`
+	Version      int    `json:"version"`
+}
+
 // TreasuryFundingRequest records a top-up.
 type TreasuryFundingRequest struct {
 	Asset             string `json:"asset" binding:"required,max=10"`
+	ProviderID        string `json:"provider_id" binding:"max=26"` // which provider's vault; empty = the currency's home provider
 	Amount            string `json:"amount" binding:"required,max=40"`
 	ExternalReference string `json:"external_reference" binding:"required,min=3,max=64"`
 	Note              string `json:"note" binding:"max=200"`
 }
 
-// CustomerAdjustmentRequest asks to credit a customer from the company's free
-// funds, or to debit money back out of their wallet.
+// CustomerAdjustmentRequest asks to credit a customer from Tribe Funds, or to
+// debit money back out of their wallet.
 type CustomerAdjustmentRequest struct {
 	Kind   string `json:"kind" binding:"required,oneof=credit debit"`
 	Asset  string `json:"asset" binding:"required,max=10"`

@@ -285,14 +285,14 @@ func TestQuoteFromDollarAmount(test *testing.T) {
 	}
 }
 
-// TestCustomerAdjustmentsUseFreeFundsAndASecondAdmin checks manual credits
-// and debits end to end: a credit can never be bigger than the vault's FREE
-// funds (vault minus what customers are owed), a debit never bigger than the
-// wallet, only a super admin approves (never their own), and the books still balance.
-func TestCustomerAdjustmentsUseFreeFundsAndASecondAdmin(test *testing.T) {
+// TestCustomerAdjustmentsArePaidFromTribeFunds checks manual credits and
+// debits end to end: a credit can never be bigger than the currency's Tribe
+// Funds (Tribe's own share of the money at the providers; customers' money is
+// never given away), a debit never bigger than the wallet, only a super admin
+// approves (never their own), and the books still balance.
+func TestCustomerAdjustmentsArePaidFromTribeFunds(test *testing.T) {
 	environment := testenv.Start(test)
 	customer := environment.RegisterUser(test, "adjustee")
-	customer.TopUp(test, "USD", "40") // customer money in the vault: must NOT count as free
 	finance := environment.SignInAdmin(test, "finance@tribe.africa")
 	superAdmin := environment.SignInAdmin(test, "super@tribe.africa")
 
@@ -300,29 +300,43 @@ func TestCustomerAdjustmentsUseFreeFundsAndASecondAdmin(test *testing.T) {
 	if err := environment.App.Database.Where("email = ?", customer.Email).Take(&user).Error; err != nil {
 		test.Fatalf("find customer: %v", err)
 	}
-	freeUsd := func() string {
+	// Tribe Funds USD as the admin sees it (/free-funds).
+	tribeFundsUsd := func() money.Amount {
 		var funds []struct {
-			AssetCode string `json:"asset_code"`
-			Free      string `json:"free"`
+			AssetCode  string `json:"asset_code"`
+			Free       string `json:"free"`
+			TribeFunds string `json:"tribe_funds"`
 		}
 		finance.Call(test, http.MethodGet, "/admin-api/free-funds", nil, "").Decode(test, &funds)
 		for _, fund := range funds {
 			if fund.AssetCode == "USD" {
-				return fund.Free
+				if fund.Free != fund.TribeFunds {
+					test.Fatalf("USD free %s differs from Tribe Funds %s", fund.Free, fund.TribeFunds)
+				}
+				amount, err := money.ParseDecimal(fund.TribeFunds, 2)
+				if err != nil {
+					test.Fatalf("read USD Tribe Funds %q: %v", fund.TribeFunds, err)
+				}
+				return amount
 			}
 		}
-		return "missing"
+		test.Fatal("free funds has no USD row")
+		return money.Zero()
+	}
+	dollars := func(text string) money.Amount {
+		amount, _ := money.ParseDecimal(text, 2)
+		return amount
 	}
 	type adjustment struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`
 	}
-	request := func(kind string, amount string) *testenv.Response {
+	request := func(kind string, amount money.Amount) *testenv.Response {
 		return finance.Call(test, http.MethodPost, "/admin-api/customers/"+user.ID+"/adjustments", map[string]string{
-			"kind": kind, "asset": "USD", "amount": amount, "reason": "Integration test",
+			"kind": kind, "asset": "USD", "amount": amount.Decimal(2), "reason": "Integration test",
 		}, testenv.NewKey())
 	}
-	approve := func(kind string, amount string) {
+	approve := func(kind string, amount money.Amount) {
 		var pending adjustment
 		request(kind, amount).Decode(test, &pending)
 		if pending.Status != "pending" {
@@ -339,42 +353,67 @@ func TestCustomerAdjustmentsUseFreeFundsAndASecondAdmin(test *testing.T) {
 		}
 	}
 
-	startFree := freeUsd()
+	// The seeder's floats and demo swap already put some USD in Tribe Funds.
+	start := tribeFundsUsd()
+	if tooBig := request("credit", start.Add(dollars("0.01"))); tooBig.Code != "INSUFFICIENT_TRIBE_FUNDS" {
+		test.Fatalf("crediting more than Tribe Funds gave %d %s, want INSUFFICIENT_TRIBE_FUNDS", tooBig.Status, tooBig.Code)
+	}
+
+	// A customer's deposit is customer money: Tribe Funds do not move.
+	customer.TopUp(test, "USD", "40")
+	if now := tribeFundsUsd(); now.Compare(start) != 0 {
+		test.Fatalf("a customer deposit moved Tribe Funds from %s to %s", start.Decimal(2), now.Decimal(2))
+	}
+	// Treasury funding into a provider vault is Tribe's own money.
+	var globalFx models.Provider
+	environment.App.Database.Where("slug = ?", "global-simulator").Take(&globalFx)
 	funding := finance.Call(test, http.MethodPost, "/admin-api/treasury-fundings", map[string]string{
-		"asset": "USD", "amount": "1000", "external_reference": "BANK-ADJ-1", "note": "Test",
+		"asset": "USD", "provider_id": globalFx.ID, "amount": "1000", "external_reference": "BANK-ADJ-1", "note": "Test",
 	}, testenv.NewKey())
 	var fundingRow adjustment
 	funding.Decode(test, &fundingRow)
 	superAdmin.Call(test, http.MethodPost, "/admin-api/treasury-fundings/"+fundingRow.ID+"/approve", nil, testenv.NewKey())
-	if startFree != "0.00" || freeUsd() != "1000.00" {
-		test.Fatalf("free USD went %s -> %s, want 0.00 -> 1000.00 (the customer's 40 is not free)", startFree, freeUsd())
+	// The customer swaps $40 to Naira: the 0.5% fee ($0.20) is Tribe's.
+	quote := customer.Call(test, http.MethodPost, "/api/mobile/v1/quotes", map[string]string{
+		"transaction_type": "swap", "from_asset": "USD", "to_asset": "NGN", "amount": "40",
+	}, "")
+	var quoteData struct {
+		ID string `json:"id"`
+	}
+	quote.Decode(test, &quoteData)
+	if swap := customer.Call(test, http.MethodPost, "/api/mobile/v1/swaps", map[string]string{"quote_id": quoteData.ID, "pin": testenv.DemoPin}, testenv.NewKey()); !swap.Success {
+		test.Fatalf("swap failed: %s %s", swap.Code, swap.Message)
+	}
+	available := tribeFundsUsd()
+	if gained := available.Subtract(start); gained.Decimal(2) != "1000.20" {
+		test.Fatalf("Tribe Funds USD grew by %s, want 1000.20 (treasury 1000 + fee 0.20)", gained.Decimal(2))
 	}
 
-	if tooBig := request("credit", "1000.01"); tooBig.Code != "INSUFFICIENT_FREE_FUNDS" {
-		test.Fatalf("crediting more than the free funds gave %d %s, want INSUFFICIENT_FREE_FUNDS", tooBig.Status, tooBig.Code)
+	if tooBig := request("credit", available.Add(dollars("0.01"))); tooBig.Code != "INSUFFICIENT_TRIBE_FUNDS" {
+		test.Fatalf("crediting more than Tribe Funds gave %d %s, want INSUFFICIENT_TRIBE_FUNDS", tooBig.Status, tooBig.Code)
 	}
-	approve("credit", "300")
-	if balance := customer.Balance(test, "USD"); balance != "340.00" {
-		test.Fatalf("balance after credit = %s, want 340.00", balance)
+	approve("credit", dollars("300"))
+	if balance := customer.Balance(test, "USD"); balance != "300.00" {
+		test.Fatalf("balance after credit = %s, want 300.00", balance)
 	}
-	if free := freeUsd(); free != "700.00" {
-		test.Fatalf("free USD after a 300 credit = %s, want 700.00", free)
+	if left := tribeFundsUsd(); left.Compare(available.Subtract(dollars("300"))) != 0 {
+		test.Fatalf("Tribe Funds after a 300 credit = %s, want %s", left.Decimal(2), available.Subtract(dollars("300")).Decimal(2))
 	}
 
-	if tooBig := request("debit", "340.01"); tooBig.Code != "INSUFFICIENT_FUNDS" {
+	if tooBig := request("debit", dollars("300.01")); tooBig.Code != "INSUFFICIENT_FUNDS" {
 		test.Fatalf("debiting more than the wallet gave %d %s, want INSUFFICIENT_FUNDS", tooBig.Status, tooBig.Code)
 	}
-	approve("debit", "100")
-	if balance := customer.Balance(test, "USD"); balance != "240.00" {
-		test.Fatalf("balance after debit = %s, want 240.00", balance)
+	approve("debit", dollars("100"))
+	if balance := customer.Balance(test, "USD"); balance != "200.00" {
+		test.Fatalf("balance after debit = %s, want 200.00", balance)
 	}
-	if free := freeUsd(); free != "800.00" {
-		test.Fatalf("free USD after a 100 debit = %s, want 800.00", free)
+	if left := tribeFundsUsd(); left.Compare(available.Subtract(dollars("200"))) != 0 {
+		test.Fatalf("Tribe Funds after a 100 debit = %s, want %s", left.Decimal(2), available.Subtract(dollars("200")).Decimal(2))
 	}
 	// even a super admin cannot approve their own request
 	var own adjustment
 	superAdmin.Call(test, http.MethodPost, "/admin-api/customers/"+user.ID+"/adjustments", map[string]string{
-		"kind": "credit", "asset": "USD", "amount": "1", "reason": "Own request",
+		"kind": "credit", "asset": "USD", "amount": "0.01", "reason": "Own request",
 	}, testenv.NewKey()).Decode(test, &own)
 	if ownApproval := superAdmin.Call(test, http.MethodPost, "/admin-api/customer-adjustments/"+own.ID+"/approve", nil, testenv.NewKey()); ownApproval.Code != "FOUR_EYES_REQUIRED" {
 		test.Fatalf("approving your own adjustment gave %d %s, want FOUR_EYES_REQUIRED", ownApproval.Status, ownApproval.Code)
@@ -437,11 +476,11 @@ func TestBatchedBalancesMatchOneByOne(test *testing.T) {
 				test.Fatalf("%s: free funds %s: %v", stage, assetCode, err)
 			}
 			batchedFree := freeByAsset[assetCode]
-			if batchedFree.AssetCode != assetCode || batchedFree.Vault.UnitsString() != single.Vault.UnitsString() ||
+			if batchedFree.AssetCode != assetCode || batchedFree.Vaults.UnitsString() != single.Vaults.UnitsString() ||
 				batchedFree.Owed.UnitsString() != single.Owed.UnitsString() || batchedFree.Free.UnitsString() != single.Free.UnitsString() {
-				test.Errorf("%s: free funds %s: batched vault %s owed %s free %s, one asset vault %s owed %s free %s", stage, assetCode,
-					batchedFree.Vault.UnitsString(), batchedFree.Owed.UnitsString(), batchedFree.Free.UnitsString(),
-					single.Vault.UnitsString(), single.Owed.UnitsString(), single.Free.UnitsString())
+				test.Errorf("%s: free funds %s: batched vaults %s owed %s free %s, one asset vaults %s owed %s free %s", stage, assetCode,
+					batchedFree.Vaults.UnitsString(), batchedFree.Owed.UnitsString(), batchedFree.Free.UnitsString(),
+					single.Vaults.UnitsString(), single.Owed.UnitsString(), single.Free.UnitsString())
 			}
 		}
 
@@ -453,8 +492,7 @@ func TestBatchedBalancesMatchOneByOne(test *testing.T) {
 			owed := money.Zero()
 			for _, row := range batched {
 				account := row.Account
-				owedKind := (account.UserID != nil && (account.Code == "user_primary" || account.Code == "user_referral" || account.Code == "user_card")) ||
-					(account.OwnerKey == "company" && (account.Code == "cashpoint_escrow" || account.Code == "payout_in_transit" || account.Code == "purchase_in_transit"))
+				owedKind := account.UserID != nil && (account.Code == "user_primary" || account.Code == "user_referral" || account.Code == "user_card" || account.Code == "user_cashpoint")
 				if account.AssetCode == assetCode && owedKind {
 					owed = owed.Add(row.Balance)
 				}

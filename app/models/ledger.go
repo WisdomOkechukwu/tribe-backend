@@ -145,6 +145,7 @@ type JournalLeg struct {
 	UsdRate         *string   `json:"usd_rate"`
 	NgnRate         *string   `json:"ngn_rate"`
 	Memo            string    `json:"memo"`
+	EarningSource   *string   `json:"earning_source"` // fee | margin | referral_share | adjustment, on Earnings Vault legs only
 	CreatedAt       time.Time `json:"created_at"`
 }
 
@@ -230,6 +231,7 @@ type Quote struct {
 	UsesNgnRail     bool           `json:"uses_ngn_rail"`
 	NairaInAmount   *string        `json:"naira_in_amount"`
 	NairaOutAmount  *string        `json:"naira_out_amount"`
+	MarketToAmount  *string        `json:"market_to_amount"` // to_amount at market rate, before our margin (direct routes only)
 	Route           datatypes.JSON `json:"route"`
 	ExpiresAt       time.Time      `json:"expires_at"`
 	UsedAt          *time.Time     `json:"used_at"`
@@ -288,10 +290,11 @@ type Beneficiary struct {
 // TableName tells GORM the table name.
 func (Beneficiary) TableName() string { return "beneficiaries" }
 
-// TreasuryFunding is money the company added to its vault (table: treasury_fundings).
+// TreasuryFunding is money the owners added to a provider vault (table: treasury_fundings).
 type TreasuryFunding struct {
 	ID                string     `gorm:"primaryKey" json:"id"`
 	AssetCode         string     `json:"asset_code"`
+	ProviderID        *string    `json:"provider_id"` // the provider vault funded (nil = the currency's home provider)
 	Amount            string     `json:"amount"`
 	ExternalReference string     `json:"external_reference"`
 	Note              string     `json:"note"`
@@ -306,8 +309,8 @@ type TreasuryFunding struct {
 	CreatedAt         time.Time  `json:"created_at"`
 }
 
-// CustomerAdjustment is a manual credit (money from the company's free funds
-// into a customer's wallet) or debit (money back out of it) made by admins
+// CustomerAdjustment is a manual credit (money from the currency's Earnings
+// Vault into a customer's wallet) or debit (money back out of it) made by admins
 // (table: customer_adjustments). Two admins: one requests, a different one
 // approves, and only approval posts.
 type CustomerAdjustment struct {

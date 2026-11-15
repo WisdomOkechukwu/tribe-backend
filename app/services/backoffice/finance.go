@@ -185,10 +185,15 @@ func (service *Service) journalEntryView(query *gorm.DB, entry models.JournalEnt
 
 // ─── Ledger ──────────────────────────────────────────────────────────
 
-// LedgerAccountView is a ledger account with its balance.
+// LedgerAccountView is a ledger account with its balance. Provider vaults
+// also carry the provider they mirror.
 type LedgerAccountView struct {
 	models.LedgerAccount
-	Balance string `json:"balance"`
+	Balance           string `json:"balance"`
+	ProviderID        string `json:"provider_id,omitempty"`
+	ProviderName      string `json:"provider_name,omitempty"`
+	ProviderCategory  string `json:"provider_category,omitempty"`
+	ProviderSimulator bool   `json:"provider_simulator,omitempty"`
 }
 
 // ListLedgerAccounts returns company accounts (or one user's) with balances.
@@ -196,7 +201,8 @@ func (service *Service) ListLedgerAccounts(requestContext context.Context, owner
 	query := service.database.WithContext(requestContext)
 	switch {
 	case ownerFilter == "" || ownerFilter == "company":
-		query = query.Where("owner_key = ?", "company")
+		// Tribe's own accounts and every provider vault.
+		query = query.Where("owner_key = ? OR owner_key LIKE ?", "company", ledger.ProviderOwnerPrefix+"%")
 	default:
 		query = query.Where("user_id = ?", ownerFilter)
 	}
@@ -290,16 +296,16 @@ func (service *Service) ListSnapshots(requestContext context.Context, date strin
 	return views, date, nil
 }
 
-// Inventory returns the company vault of each asset with its balance (the admin "Inventory" page).
-//
-// Only the three account kinds it shows are loaded and summed (before, every
-// company account was summed and most were thrown away).
+// Inventory returns the admin "Inventory" page: every provider vault (what
+// each provider holds for Tribe, per currency) and every currency's Tribe
+// Funds (Tribe's own share of that money), with balances. Provider vaults
+// carry their provider's name and category so the page can group them.
 func (service *Service) Inventory(requestContext context.Context) ([]LedgerAccountView, error) {
 	query := service.database.WithContext(requestContext)
 	var accounts []models.LedgerAccount
-	err := query.Where("owner_key = ? AND code IN ?", "company",
-		[]string{ledger.CodeCompanyVault, ledger.CodeCashpointEscrow, ledger.CodePayoutInTransit, ledger.CodePurchaseInTransit}).
-		Order("asset_code, code").Find(&accounts).Error
+	err := query.Where("(owner_key LIKE ? AND code = ?) OR (owner_key = ? AND code = ?)",
+		ledger.ProviderOwnerPrefix+"%", ledger.CodeProviderVault, "company", ledger.CodeTribeFunds).
+		Order("owner_key, asset_code").Find(&accounts).Error
 	if err != nil {
 		return nil, err
 	}
@@ -307,12 +313,24 @@ func (service *Service) Inventory(requestContext context.Context) ([]LedgerAccou
 	if err != nil {
 		return nil, err
 	}
-	decimals := shared.AssetDecimals(query)
-	vaults := make([]LedgerAccountView, 0, len(balances))
-	for _, balance := range balances {
-		vaults = append(vaults, LedgerAccountView{LedgerAccount: balance.Account, Balance: balance.Balance.Decimal(decimals[balance.Account.AssetCode])})
+	var providerRows []models.Provider
+	if err := query.Find(&providerRows).Error; err != nil {
+		return nil, err
 	}
-	return vaults, nil
+	providersByOwner := make(map[string]models.Provider, len(providerRows))
+	for _, provider := range providerRows {
+		providersByOwner[ledger.ProviderOwnerPrefix+provider.ID] = provider
+	}
+	decimals := shared.AssetDecimals(query)
+	views := make([]LedgerAccountView, 0, len(balances))
+	for _, balance := range balances {
+		view := LedgerAccountView{LedgerAccount: balance.Account, Balance: balance.Balance.Decimal(decimals[balance.Account.AssetCode])}
+		if provider, found := providersByOwner[balance.Account.OwnerKey]; found {
+			view.ProviderID, view.ProviderName, view.ProviderCategory, view.ProviderSimulator = provider.ID, provider.Name, provider.Category, provider.IsSimulator
+		}
+		views = append(views, view)
+	}
+	return views, nil
 }
 
 // TreasuryFundingView is a funding request with its amount in readable form.
@@ -411,18 +429,19 @@ func NewCustomerAdjustmentView(adjustment models.CustomerAdjustment, user models
 	}
 }
 
-// FreeFundsView is one currency's free funds, readable.
+// FreeFundsView is one currency seen the way the providers see it, readable.
 type FreeFundsView struct {
-	AssetCode string `json:"asset_code"`
-	Vault     string `json:"vault"`
-	Owed      string `json:"owed"`
-	Free      string `json:"free"` // may be negative when the vault is short
+	AssetCode  string `json:"asset_code"`
+	Vaults     string `json:"vaults"`      // everything the providers hold for us
+	Owed       string `json:"owed"`        // what we owe customers
+	Free       string `json:"free"`        // vaults - owed (may be negative)
+	TribeFunds string `json:"tribe_funds"` // Tribe Funds: equals free; the most admins may credit
 }
 
-// FreeFunds returns, for every enabled asset, the vault, what we owe
-// customers and the difference admins may credit. It reads every currency
-// with a fixed number of queries (see ledger.FreeFundsForAssets), and gives
-// the same numbers as ledger.FreeFundsOf would one asset at a time.
+// FreeFunds returns, for every enabled asset, what the providers hold, what
+// we owe customers, the difference, and Tribe Funds (always the same as the
+// difference; manual credits are paid from it). It reads every currency with
+// a fixed number of queries (see ledger.FreeFundsForAssets).
 func (service *Service) FreeFunds(requestContext context.Context) ([]FreeFundsView, error) {
 	query := service.database.WithContext(requestContext)
 	var assets []models.Asset
@@ -441,19 +460,20 @@ func (service *Service) FreeFunds(requestContext context.Context) ([]FreeFundsVi
 	for _, asset := range assets {
 		free := freeByAsset[asset.Code]
 		views = append(views, FreeFundsView{
-			AssetCode: asset.Code, Vault: free.Vault.Decimal(asset.DecimalPlaces),
+			AssetCode: asset.Code, Vaults: free.Vaults.Decimal(asset.DecimalPlaces),
 			Owed: free.Owed.Decimal(asset.DecimalPlaces), Free: free.Free.Decimal(asset.DecimalPlaces),
+			TribeFunds: free.TribeFunds.Decimal(asset.DecimalPlaces),
 		})
 	}
 	return views, nil
 }
 
-// InventoryEntries returns the journal legs on the company vault accounts
-// (every movement in or out of the company's own money), newest first.
-// assetCode narrows it to one currency.
+// InventoryEntries returns the journal legs on the provider vaults (every
+// movement in or out of a provider), newest first. assetCode narrows it to
+// one currency.
 func (service *Service) InventoryEntries(requestContext context.Context, assetCode string, page int) (Page[JournalLegView], error) {
 	query := service.database.WithContext(requestContext)
-	accountsQuery := query.Model(&models.LedgerAccount{}).Where("user_id IS NULL AND code = ?", ledger.CodeCompanyVault)
+	accountsQuery := query.Model(&models.LedgerAccount{}).Where("owner_key LIKE ? AND code = ?", ledger.ProviderOwnerPrefix+"%", ledger.CodeProviderVault)
 	if assetCode != "" {
 		accountsQuery = accountsQuery.Where("asset_code = ?", assetCode)
 	}

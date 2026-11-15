@@ -20,6 +20,7 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/services/ledger"
 	"github.com/tribe-africa/tribe-backend/app/services/providers"
 	"github.com/tribe-africa/tribe-backend/app/services/rates"
+	"github.com/tribe-africa/tribe-backend/app/services/referrals"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/app/services/swaps"
 	"github.com/tribe-africa/tribe-backend/database"
@@ -34,12 +35,13 @@ type Service struct {
 	rates      *rates.Service
 	auth       *auth.Service
 	providers  *providers.Registry
+	referrals  *referrals.Service
 	dispatcher *jobs.Dispatcher
 }
 
 // NewService creates the transfers service.
-func NewService(connection *gorm.DB, ledgerService *ledger.Service, ratesService *rates.Service, authService *auth.Service, registry *providers.Registry, dispatcher *jobs.Dispatcher) *Service {
-	return &Service{database: connection, ledger: ledgerService, rates: ratesService, auth: authService, providers: registry, dispatcher: dispatcher}
+func NewService(connection *gorm.DB, ledgerService *ledger.Service, ratesService *rates.Service, authService *auth.Service, registry *providers.Registry, referralsService *referrals.Service, dispatcher *jobs.Dispatcher) *Service {
+	return &Service{database: connection, ledger: ledgerService, rates: ratesService, auth: authService, providers: registry, referrals: referralsService, dispatcher: dispatcher}
 }
 
 // SendInput is everything the send flow collects.
@@ -126,6 +128,11 @@ func (service *Service) sendToTribeUser(requestContext context.Context, actor sh
 	if err != nil {
 		return nil, err
 	}
+	// A Tribe send is final at once, so an inviter's share is paid at once.
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, true)
+	if err != nil {
+		return nil, err
+	}
 
 	sent := &models.Transaction{ID: ids.New(), Reference: input.Reference, UserID: actor.UserID}
 	received := &models.Transaction{ID: ids.New(), Reference: input.Reference + ":IN", UserID: recipient.ID}
@@ -145,18 +152,14 @@ func (service *Service) sendToTribeUser(requestContext context.Context, actor sh
 			fee, _ = money.ParseUnits(quote.FeeAmount)
 			arrived, _ = money.ParseUnits(quote.ToAmount)
 			converted = totalPaid.Subtract(fee)
-			var nairaIn, nairaOut *money.Amount
-			if quote.NairaInAmount != nil {
-				parsedIn, _ := money.ParseUnits(*quote.NairaInAmount)
-				parsedOut, _ := money.ParseUnits(*quote.NairaOutAmount)
-				nairaIn, nairaOut = &parsedIn, &parsedOut
-			}
+			nairaIn, nairaOut, marketReceived := rates.MarginAmountsOf(quote)
 			postResult, err = service.ledger.PostConversion(databaseTransaction, ledger.ConversionPosting{
 				Reference: input.Reference + ":POST", TransactionType: "send_tribe", Description: "Send to @" + recipient.Tag,
 				CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &sent.ID,
 				SourceAccountID: senderWallet.ID, TargetAccountID: receiverWallet.ID,
 				FromAsset: fromAsset, ToAsset: toAsset, Converted: converted, Fee: fee, Received: arrived,
-				NairaIn: nairaIn, NairaOut: nairaOut, Rates: service.rates.RatesFor(databaseTransaction, fromAsset, toAsset, "NGN"),
+				NairaIn: nairaIn, NairaOut: nairaOut, MarketReceived: marketReceived,
+				Rates: service.rates.RatesFor(databaseTransaction, fromAsset, toAsset, "NGN"), ReferralShare: invitation.ShareOf(),
 			})
 			if err != nil {
 				return err
@@ -174,14 +177,16 @@ func (service *Service) sendToTribeUser(requestContext context.Context, actor sh
 				return err
 			}
 			arrived = converted
-			feeRevenue, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeFeeRevenue, fromAsset)
+			tribeFunds, err := service.ledger.TribeFunds(databaseTransaction, fromAsset)
 			if err != nil {
 				return err
 			}
 			postResult, err = service.ledger.Post(databaseTransaction, ledger.Entry{
 				Reference: input.Reference + ":POST", TransactionType: "send_tribe", Description: "Send to @" + recipient.Tag,
 				CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &sent.ID,
-				Legs: ledger.InternalTransferLegs(senderWallet.ID, receiverWallet.ID, feeRevenue.ID, converted, fee),
+				Legs:          ledger.InternalTransferLegs(senderWallet.ID, receiverWallet.ID, tribeFunds.ID, converted, fee),
+				Rates:         ledger.RatesFromPairs(service.rates.RatesFor(databaseTransaction, fromAsset, "NGN")),
+				ReferralShare: invitation.ShareOf(),
 			})
 			if err != nil {
 				return err
@@ -208,6 +213,9 @@ func (service *Service) sendToTribeUser(requestContext context.Context, actor sh
 		if err := shared.RecordTransaction(databaseTransaction, sent); err != nil {
 			return err
 		}
+		if err := service.referrals.Record(databaseTransaction, invitation, sent, postResult); err != nil {
+			return err
+		}
 		if err := shared.NotifyTransaction(databaseTransaction, sent, "money", "Money sent"); err != nil {
 			return err
 		}
@@ -227,8 +235,9 @@ func (service *Service) sendToTribeUser(requestContext context.Context, actor sh
 }
 
 // sendOut sends money to a bank account or crypto wallet outside Tribe.
-// The user's money is taken now and parked in "Payouts In Transit"; the
-// ProcessPayout job asks the provider and then confirms or refunds.
+// The user's money is taken now and the provider vault that pays it out goes
+// down at once; the ProcessPayout job asks the provider, then completes the
+// payout or, if the provider refuses, puts the amount back.
 func (service *Service) sendOut(requestContext context.Context, actor shared.Actor, input SendInput) (*models.Transaction, error) {
 	if strings.TrimSpace(input.Handle) == "" {
 		return nil, apperrors.Validation(map[string][]string{"handle": {"Enter the account number or wallet address."}})
@@ -256,13 +265,22 @@ func (service *Service) sendOut(requestContext context.Context, actor shared.Act
 		return nil, err
 	}
 	service.EnsurePayoutRefundWallet(requestContext, actor.UserID, payoutAsset)
+	// The provider may still refuse a payout, so an inviter's share waits in
+	// the Referral Vault until ProcessPayout hears back.
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, false)
+	if err != nil {
+		return nil, err
+	}
 
 	transaction := &models.Transaction{ID: ids.New(), Reference: input.Reference, UserID: actor.UserID}
 	err = database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
-		payoutInTransit, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodePayoutInTransit, payoutAsset)
+		// The payout currency's home provider pays it out, so its vault goes
+		// down now. Its id is saved on the transaction, so a refusal later puts
+		// the money back into the SAME vault even if the home provider changes.
+		payoutVault, err := service.ledger.HomeVault(databaseTransaction, payoutAsset)
 		if err != nil {
 			return err
 		}
@@ -277,19 +295,15 @@ func (service *Service) sendOut(requestContext context.Context, actor shared.Act
 			fee, _ = money.ParseUnits(quote.FeeAmount)
 			payoutAmount, _ = money.ParseUnits(quote.ToAmount)
 			converted = totalPaid.Subtract(fee)
-			var nairaIn, nairaOut *money.Amount
-			if quote.NairaInAmount != nil {
-				parsedIn, _ := money.ParseUnits(*quote.NairaInAmount)
-				parsedOut, _ := money.ParseUnits(*quote.NairaOutAmount)
-				nairaIn, nairaOut = &parsedIn, &parsedOut
-			}
-			// Convert straight into "Payouts In Transit" of the payout currency.
+			nairaIn, nairaOut, marketReceived := rates.MarginAmountsOf(quote)
+			// Convert straight into the provider vault that pays it out.
 			postResult, err = service.ledger.PostConversion(databaseTransaction, ledger.ConversionPosting{
 				Reference: input.Reference + ":POST", TransactionType: "send_external", Description: "Payout to " + input.Handle,
 				CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-				SourceAccountID: userWallet.ID, TargetAccountID: payoutInTransit.ID,
+				SourceAccountID: userWallet.ID, TargetAccountID: payoutVault.ID,
 				FromAsset: fromAsset, ToAsset: payoutAsset, Converted: converted, Fee: fee, Received: payoutAmount,
-				NairaIn: nairaIn, NairaOut: nairaOut, Rates: service.rates.RatesFor(databaseTransaction, fromAsset, payoutAsset, "NGN"),
+				NairaIn: nairaIn, NairaOut: nairaOut, MarketReceived: marketReceived,
+				Rates: service.rates.RatesFor(databaseTransaction, fromAsset, payoutAsset, "NGN"), ReferralShare: invitation.ShareOf(),
 			})
 			if err != nil {
 				return err
@@ -307,14 +321,16 @@ func (service *Service) sendOut(requestContext context.Context, actor shared.Act
 				return err
 			}
 			payoutAmount = converted
-			feeRevenue, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeFeeRevenue, fromAsset)
+			tribeFunds, err := service.ledger.TribeFunds(databaseTransaction, fromAsset)
 			if err != nil {
 				return err
 			}
 			postResult, err = service.ledger.Post(databaseTransaction, ledger.Entry{
 				Reference: input.Reference + ":POST", TransactionType: "send_external", Description: "Payout to " + input.Handle,
 				CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-				Legs: ledger.PayoutStartLegs(userWallet.ID, payoutInTransit.ID, feeRevenue.ID, converted, fee),
+				Legs:          ledger.PayoutLegs(userWallet.ID, payoutVault.ID, tribeFunds.ID, converted, fee),
+				Rates:         ledger.RatesFromPairs(service.rates.RatesFor(databaseTransaction, fromAsset, "NGN")),
+				ReferralShare: invitation.ShareOf(),
 			})
 			if err != nil {
 				return err
@@ -343,10 +359,13 @@ func (service *Service) sendOut(requestContext context.Context, actor shared.Act
 			Metadata: shared.JSON(map[string]any{
 				"recipient_kind": input.RecipientKind, "handle": input.Handle, "recipient": name, "channel": input.ChannelID,
 				"network": input.Network, "country": input.Country, "scope": scope, "details": input.Details,
-				"payout_asset": payoutAsset, "payout_amount": payoutText,
+				"payout_asset": payoutAsset, "payout_amount": payoutText, "payout_vault_account_id": payoutVault.ID,
 			}),
 		}
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, postResult); err != nil {
 			return err
 		}
 		if err := shared.NotifyTransaction(databaseTransaction, transaction, "money", "Payment on its way"); err != nil {
@@ -372,8 +391,11 @@ func (service *Service) sendOut(requestContext context.Context, actor shared.Act
 //     must never hold row locks). The reference is sent as the provider's own
 //     idempotency key, so a retry can't pay twice at the provider either.
 //  3. In a transaction: lock the transaction row, check it is STILL pending,
-//     then post "confirmed" (Dr In Transit / Cr Vault) or "refund"
-//     (Dr In Transit / Cr User Wallet) and update the status.
+//     then mark it completed, or post the refund (Dr Provider Vault / Cr
+//     User Wallet: the money never left the provider) and mark it failed.
+//
+// Either way the fee stays earned (a refund returns the amount, not the
+// fee), so an inviter's share waiting for this answer is paid.
 func (service *Service) ProcessPayout(requestContext context.Context, transactionID string) error {
 	var transaction models.Transaction
 	if err := service.database.WithContext(requestContext).Where("id = ?", transactionID).Take(&transaction).Error; err != nil {
@@ -388,6 +410,7 @@ func (service *Service) ProcessPayout(requestContext context.Context, transactio
 		Details       map[string]string `json:"details"`
 		PayoutAsset   string            `json:"payout_asset"`
 		PayoutAmount  string            `json:"payout_amount"`
+		PayoutVaultID uint64            `json:"payout_vault_account_id"`
 	}
 	json.Unmarshal(transaction.Metadata, &metadata)
 	destination := map[string]string{"handle": metadata.Handle}
@@ -420,20 +443,12 @@ func (service *Service) ProcessPayout(requestContext context.Context, transactio
 		if locked.Status != models.TransactionStatusPending {
 			return nil // someone else finished it while we waited for the provider
 		}
-		inTransit, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodePayoutInTransit, metadata.PayoutAsset)
-		if err != nil {
-			return err
-		}
 		now := time.Now().UTC()
 		if result.Status == "succeeded" {
-			vault, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCompanyVault, metadata.PayoutAsset)
-			if err != nil {
-				return err
-			}
-			if _, err := service.ledger.Post(databaseTransaction, ledger.Entry{
-				Reference: locked.Reference + ":SETTLE", TransactionType: "send_external_settled", Description: "Payout confirmed " + result.ProviderReference,
-				BusinessTransactionID: &locked.ID, Legs: ledger.PayoutSucceededLegs(inTransit.ID, vault.ID, payoutAmount),
-			}); err != nil {
+			// The money already left the provider vault when the payout was
+			// posted, so there is nothing to post now: just complete it, and
+			// pay an inviter's share that was waiting for this answer.
+			if err := service.referrals.PayAccrued(databaseTransaction, locked.ID); err != nil {
 				return err
 			}
 			if err := databaseTransaction.Model(&models.Transaction{}).Where("id = ?", locked.ID).
@@ -443,15 +458,31 @@ func (service *Service) ProcessPayout(requestContext context.Context, transactio
 			return shared.Notify(databaseTransaction, locked.UserID, "money", "Money delivered", locked.Title, "/transaction/"+locked.ID)
 		}
 
-		// Failed: refund into the user's wallet of the payout currency.
+		// Refused: the money never left the provider. Put the amount back in its
+		// vault and in the user's wallet of the payout currency (the fee stays
+		// earned, so an inviter's share of it is still paid).
+		var payoutVault *models.LedgerAccount
+		var err error
+		if metadata.PayoutVaultID != 0 {
+			payoutVault = &models.LedgerAccount{}
+			err = databaseTransaction.Where("id = ?", metadata.PayoutVaultID).Take(payoutVault).Error
+		} else {
+			payoutVault, err = service.ledger.HomeVault(databaseTransaction, metadata.PayoutAsset)
+		}
+		if err != nil {
+			return err
+		}
 		var refundWallet models.LedgerAccount
 		if err := databaseTransaction.Where("owner_key = ? AND code = ? AND asset_code = ?", "user:"+locked.UserID, ledger.CodeUserPrimary, metadata.PayoutAsset).Take(&refundWallet).Error; err != nil {
 			slog.Error("refund wallet missing", "transaction", locked.ID, "asset", metadata.PayoutAsset)
 			return err
 		}
+		if err := service.referrals.PayAccrued(databaseTransaction, locked.ID); err != nil {
+			return err
+		}
 		if _, err := service.ledger.Post(databaseTransaction, ledger.Entry{
 			Reference: locked.Reference + ":REFUND", TransactionType: "send_external_refunded", Description: "Payout failed: " + result.FailureReason,
-			BusinessTransactionID: &locked.ID, Legs: ledger.PayoutFailedLegs(inTransit.ID, refundWallet.ID, payoutAmount),
+			BusinessTransactionID: &locked.ID, Legs: ledger.PayoutFailedLegs(payoutVault.ID, refundWallet.ID, payoutAmount),
 		}); err != nil {
 			return err
 		}

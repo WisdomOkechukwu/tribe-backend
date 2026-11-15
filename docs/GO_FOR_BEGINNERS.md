@@ -149,7 +149,7 @@ If the function returns an error, everything inside is rolled back.
 ```
 Dr Sender wallet   5.00 + fee
 Cr Ada's wallet    5.00
-Cr Fee Revenue     fee
+Cr Tribe Funds     fee
 ```
 
 The steps, in order:

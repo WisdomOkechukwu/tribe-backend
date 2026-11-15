@@ -7,7 +7,7 @@ import (
 )
 
 // ConversionPosting describes a conversion to post. Swaps, card funding,
-// bills and gift cards paid with another currency all use it.
+// bills, gift cards and payouts paid with another currency all use it.
 type ConversionPosting struct {
 	Reference             string
 	TransactionType       string
@@ -15,7 +15,7 @@ type ConversionPosting struct {
 	CreatedBy             string
 	BusinessTransactionID *string
 	SourceAccountID       uint64 // where the money comes from
-	TargetAccountID       uint64 // where the converted money goes
+	TargetAccountID       uint64 // where the converted money goes (a wallet, a card, or a provider vault that pays someone)
 	FromAsset             string
 	ToAsset               string
 	Converted             money.Amount // from-asset amount converted (fee NOT included)
@@ -23,23 +23,27 @@ type ConversionPosting struct {
 	Received              money.Amount // to-asset amount that arrives
 	NairaIn               *money.Amount
 	NairaOut              *money.Amount
+	MarketReceived        *money.Amount        // direct routes: to-asset amount at market (see ConversionAmounts)
 	Rates                 map[string][2]string // asset -> [usd, ngn] at this moment
 	Metadata              map[string]any
+	ReferralShare         *ReferralShare // set when the customer was invited (see Entry.ReferralShare)
+	// ExtraLegs are added to the same entry, for example the transfer of the
+	// dollars that back a card from the home provider to the card issuer.
+	ExtraLegs []Leg
 }
 
-// PostConversion finds the company accounts a conversion needs and posts it.
-// If both sides are the same asset, it simply moves the money (plus fee).
+// PostConversion finds the accounts a conversion needs and posts it. The
+// from-asset leaves its HOME provider vault and the to-asset arrives in its
+// home vault (HomeVault); fees and margins go to Tribe Funds. If both sides
+// are the same asset, it simply moves the money (plus fee).
 func (service *Service) PostConversion(databaseTransaction *gorm.DB, posting ConversionPosting) (*PostResult, error) {
 	entry := Entry{
 		Reference: posting.Reference, TransactionType: posting.TransactionType, Description: posting.Description,
 		CreatedBy: posting.CreatedBy, BusinessTransactionID: posting.BusinessTransactionID, Metadata: posting.Metadata,
-		Rates: map[string]AssetRate{},
-	}
-	for assetCode, pair := range posting.Rates {
-		entry.Rates[assetCode] = AssetRate{Usd: pair[0], Ngn: pair[1]}
+		Rates: RatesFromPairs(posting.Rates), ReferralShare: posting.ReferralShare,
 	}
 
-	sourceFeeRevenue, err := service.CompanyAccount(databaseTransaction, CodeFeeRevenue, posting.FromAsset)
+	sourceFunds, err := service.TribeFunds(databaseTransaction, posting.FromAsset)
 	if err != nil {
 		return nil, err
 	}
@@ -48,37 +52,43 @@ func (service *Service) PostConversion(databaseTransaction *gorm.DB, posting Con
 	if posting.FromAsset == posting.ToAsset {
 		entry.Legs = MoveLegs(posting.SourceAccountID, posting.TargetAccountID, posting.Converted, posting.Description)
 		if posting.Fee.IsPositive() {
-			entry.Legs = append(entry.Legs, FeeLegs(posting.SourceAccountID, sourceFeeRevenue.ID, posting.Fee, "Fee")...)
+			entry.Legs = append(entry.Legs, FeeLegs(posting.SourceAccountID, sourceFunds.ID, posting.Fee, "Fee")...)
 		}
+		entry.Legs = append(entry.Legs, posting.ExtraLegs...)
 		return service.Post(databaseTransaction, entry)
 	}
 
-	sourceClearing, err := service.CompanyAccount(databaseTransaction, CodeSwapClearing, posting.FromAsset)
+	sourceVault, err := service.HomeVault(databaseTransaction, posting.FromAsset)
 	if err != nil {
 		return nil, err
 	}
-	targetClearing, err := service.CompanyAccount(databaseTransaction, CodeSwapClearing, posting.ToAsset)
+	targetVault, err := service.HomeVault(databaseTransaction, posting.ToAsset)
+	if err != nil {
+		return nil, err
+	}
+	targetFunds, err := service.TribeFunds(databaseTransaction, posting.ToAsset)
 	if err != nil {
 		return nil, err
 	}
 	accounts := ConversionAccounts{
-		Source: posting.SourceAccountID, SourceClearing: sourceClearing.ID, SourceFeeRevenue: sourceFeeRevenue.ID,
-		TargetClearing: targetClearing.ID, Target: posting.TargetAccountID,
+		Source: posting.SourceAccountID, SourceVault: sourceVault.ID, SourceFunds: sourceFunds.ID,
+		TargetVault: targetVault.ID, TargetFunds: targetFunds.ID, Target: posting.TargetAccountID,
 	}
 	if posting.NairaIn != nil && posting.NairaOut != nil {
-		nairaClearing, err := service.CompanyAccount(databaseTransaction, CodeSwapClearing, "NGN")
+		nairaVault, err := service.HomeVault(databaseTransaction, "NGN")
 		if err != nil {
 			return nil, err
 		}
-		nairaMargin, err := service.CompanyAccount(databaseTransaction, CodeFxMarginRevenue, "NGN")
+		nairaFunds, err := service.TribeFunds(databaseTransaction, "NGN")
 		if err != nil {
 			return nil, err
 		}
-		accounts.NairaClearing, accounts.NairaMargin = nairaClearing.ID, nairaMargin.ID
+		accounts.NairaVault, accounts.NairaFunds = nairaVault.ID, nairaFunds.ID
 	}
 	entry.Legs = ConversionLegs(accounts, ConversionAmounts{
 		SourceAmount: posting.Converted, Fee: posting.Fee, TargetAmount: posting.Received,
-		NairaIn: posting.NairaIn, NairaOut: posting.NairaOut,
+		NairaIn: posting.NairaIn, NairaOut: posting.NairaOut, MarketReceived: posting.MarketReceived,
 	})
+	entry.Legs = append(entry.Legs, posting.ExtraLegs...)
 	return service.Post(databaseTransaction, entry)
 }

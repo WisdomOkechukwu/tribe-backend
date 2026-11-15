@@ -19,7 +19,9 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/services/adminauth"
 	"github.com/tribe-africa/tribe-backend/app/services/ledger"
 	"github.com/tribe-africa/tribe-backend/app/services/providers"
+	"github.com/tribe-africa/tribe-backend/app/services/rates"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
+	"github.com/tribe-africa/tribe-backend/app/services/swaps"
 	"github.com/tribe-africa/tribe-backend/pkg/ids"
 )
 
@@ -30,13 +32,14 @@ func Run(requestContext context.Context, application *bootstrap.App) error {
 		run  func(context.Context, *bootstrap.App) error
 	}{
 		{"providers and assets", seedProvidersAndAssets},
-		{"company ledger accounts", seedCompanyAccounts},
+		{"Tribe Funds and provider vaults", seedCompanyAccounts},
 		{"rate margins and fees", seedPricing},
 		{"billers and gift card brands", seedCatalog},
 		{"service switches", seedServices},
 		{"card designs", seedCardDesigns},
 		{"first exchange rates", seedRates},
 		{"admin team", seedAdmins},
+		{"provider floats", seedProviderFloats},
 		{"demo customers", seedDemoCustomers},
 	}
 	for _, step := range steps {
@@ -128,10 +131,14 @@ func seedProvidersAndAssets(requestContext context.Context, application *bootstr
 	return insertMissing(query, &providerAssets)
 }
 
-// seedCompanyAccounts creates the company chart of accounts for every asset.
+// seedCompanyAccounts opens the ledger the providers are mirrored in:
+// Tribe Funds for every asset, and a vault for every currency each provider
+// handles (provider_assets): "Crypto Desk · BTC", "Global FX · USD",
+// "Bills · NGN", "Gift Cards · USD", "Card Issuer · USD" ...
 func seedCompanyAccounts(requestContext context.Context, application *bootstrap.App) error {
+	query := application.Database.WithContext(requestContext)
 	var assets []models.Asset
-	if err := application.Database.WithContext(requestContext).Find(&assets).Error; err != nil {
+	if err := query.Find(&assets).Error; err != nil {
 		return err
 	}
 	for _, asset := range assets {
@@ -139,6 +146,64 @@ func seedCompanyAccounts(requestContext context.Context, application *bootstrap.
 			if _, err := application.Ledger.EnsureCompanyAccount(requestContext, template, asset.Code); err != nil {
 				return err
 			}
+		}
+	}
+	var providerRows []models.Provider
+	if err := query.Find(&providerRows).Error; err != nil {
+		return err
+	}
+	providersByID := make(map[string]models.Provider, len(providerRows))
+	for _, provider := range providerRows {
+		providersByID[provider.ID] = provider
+	}
+	var providerAssets []models.ProviderAsset
+	if err := query.Find(&providerAssets).Error; err != nil {
+		return err
+	}
+	for _, providerAsset := range providerAssets {
+		if _, err := application.Ledger.EnsureProviderVault(requestContext, providersByID[providerAsset.ProviderID], providerAsset.AssetCode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// seedProviderFloats puts Tribe's own money into the provider vaults that
+// pay third parties (the biller, the gift card provider) and into the home
+// vaults, through the REAL two-admin treasury funding flow: the finance
+// admin records it, the super admin approves it. Without a float the first
+// bill would take the bills provider's vault below zero, and admins would
+// have no Tribe Funds to credit customers from. The fixed references make
+// it run once.
+func seedProviderFloats(requestContext context.Context, application *bootstrap.App) error {
+	query := application.Database.WithContext(requestContext)
+	var finance, superAdmin models.AdminUser
+	if err := query.Where("email = ?", "finance@tribe.africa").Take(&finance).Error; err != nil {
+		return err
+	}
+	if err := query.Where("email = ?", "super@tribe.africa").Take(&superAdmin).Error; err != nil {
+		return err
+	}
+	floats := []struct{ tag, providerID, assetCode, amount string }{
+		{"BILLS", providerUtilities, "NGN", "2000000"},  // pays bills
+		{"GIFTCARDS", providerGiftCards, "USD", "2000"}, // buys gift cards
+		{"GLOBAL", providerGlobal, "NGN", "500000"},     // Tribe's own Naira (credits, referral rewards)
+		{"GLOBAL", providerGlobal, "USD", "1000"},       // Tribe's own dollars
+		{"CRYPTO", providerCrypto, "USDT", "1000"},      // Tribe's own stablecoins
+	}
+	for _, float := range floats {
+		reference := "SEED-FLOAT-" + float.tag + "-" + float.assetCode
+		var existing int64
+		query.Model(&models.TreasuryFunding{}).Where("asset_code = ? AND external_reference = ?", float.assetCode, reference).Count(&existing)
+		if existing > 0 {
+			continue
+		}
+		funding, err := application.Wallets.RequestTreasuryFunding(requestContext, finance.ID, finance.Name, float.assetCode, float.providerID, float.amount, reference, "Opening float (seeder)")
+		if err != nil {
+			return err
+		}
+		if _, err := application.Wallets.ApproveTreasuryFunding(requestContext, superAdmin.ID, superAdmin.Name, funding.ID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -303,6 +368,9 @@ func seedRates(requestContext context.Context, application *bootstrap.App) error
 // DemoPassword is the password of every seeded admin and demo customer (local only).
 const DemoPassword = "Tribe@2026"
 
+// demoPin is the transaction PIN of every demo customer (local only).
+const demoPin = "2580"
+
 func seedAdmins(requestContext context.Context, application *bootstrap.App) error {
 	presets := map[string][]string{
 		"super_admin": adminauth.AllPermissions(),
@@ -338,12 +406,15 @@ func seedAdmins(requestContext context.Context, application *bootstrap.App) erro
 // seedDemoCustomers creates two customers with a PIN and some money, so the
 // app has something to show. They have NO active device yet: the first phone
 // that signs in becomes their active phone (a "new entry").
+//
+// Tunde joined with Ada's referral code, and makes one swap, so Ada's
+// referral balance shows a real share of what Tribe earned on it.
 func seedDemoCustomers(requestContext context.Context, application *bootstrap.App) error {
 	query := application.Database.WithContext(requestContext)
 	now := time.Now().UTC()
-	customers := []struct{ first, last, tag, email string }{
-		{"Ada", "Okafor", "ada", "ada@example.com"},
-		{"Tunde", "Bello", "tunde", "tunde@example.com"},
+	customers := []struct{ first, last, tag, email, invitedBy string }{
+		{"Ada", "Okafor", "ada", "ada@example.com", ""},
+		{"Tunde", "Bello", "tunde", "tunde@example.com", "ada@example.com"},
 	}
 	for _, customer := range customers {
 		var user models.User
@@ -354,10 +425,17 @@ func seedDemoCustomers(requestContext context.Context, application *bootstrap.Ap
 				KycTier: 1, KycStatus: "approved", GlobalAccountsStatus: "none", ReferralCode: "TRIBE-" + customer.tag[:3],
 				Labels: []byte("[]"), EmailVerifiedAt: &now, Version: 1, CreatedAt: now, UpdatedAt: now,
 			}
+			if customer.invitedBy != "" {
+				var inviter models.User
+				if err := query.Where("email = ?", customer.invitedBy).Take(&inviter).Error; err != nil {
+					return err
+				}
+				user.ReferredByUserID = &inviter.ID
+			}
 			if err := query.Create(&user).Error; err != nil {
 				return err
 			}
-			if err := application.Auth.SetPin(requestContext, user.ID, "2580"); err != nil {
+			if err := application.Auth.SetPin(requestContext, user.ID, demoPin); err != nil {
 				return err
 			}
 		}
@@ -382,13 +460,30 @@ func seedDemoCustomers(requestContext context.Context, application *bootstrap.Ap
 				return err
 			}
 		}
-		var earnings int64
-		query.Model(&models.ReferralEarning{}).Where("user_id = ?", user.ID).Count(&earnings)
-		if earnings == 0 {
-			if err := application.Products.AwardReferral(requestContext, user.ID, "Chika N.", "Friend made their first swap", "2000"); err != nil {
+		if customer.invitedBy != "" {
+			if err := seedDemoSwap(requestContext, application, user.ID, "SEED-"+customer.tag+"-SWAP"); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// seedDemoSwap swaps $50 to Naira through the REAL quote and swap services,
+// so the fee and margin land in the Earnings Vault and the inviter's share
+// in their referral balance. The fixed reference makes it run once.
+func seedDemoSwap(requestContext context.Context, application *bootstrap.App, userID string, reference string) error {
+	var existing int64
+	application.Database.WithContext(requestContext).Model(&models.Transaction{}).Where("reference = ?", reference).Count(&existing)
+	if existing > 0 {
+		return nil
+	}
+	quote, _, err := application.Rates.CreateQuote(requestContext, userID, rates.PriceInput{
+		TransactionType: "swap", FromAsset: "USD", ToAsset: "NGN", PayAmount: "50",
+	})
+	if err != nil {
+		return err
+	}
+	_, err = application.Swaps.Swap(requestContext, shared.Actor{UserID: userID}, swaps.SwapInput{QuoteID: quote.ID, Pin: demoPin, Reference: reference})
+	return err
 }

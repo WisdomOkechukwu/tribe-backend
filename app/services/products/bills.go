@@ -20,6 +20,7 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/services/ledger"
 	"github.com/tribe-africa/tribe-backend/app/services/providers"
 	"github.com/tribe-africa/tribe-backend/app/services/rates"
+	"github.com/tribe-africa/tribe-backend/app/services/referrals"
 	"github.com/tribe-africa/tribe-backend/app/services/security"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/app/services/swaps"
@@ -36,14 +37,15 @@ type Service struct {
 	rates      *rates.Service
 	auth       *auth.Service
 	providers  *providers.Registry
+	referrals  *referrals.Service
 	dispatcher *jobs.Dispatcher
 	toolkit    *security.Toolkit
 	settings   config.Config
 }
 
 // NewService creates the products service.
-func NewService(connection *gorm.DB, ledgerService *ledger.Service, ratesService *rates.Service, authService *auth.Service, registry *providers.Registry, dispatcher *jobs.Dispatcher, toolkit *security.Toolkit, settings config.Config) *Service {
-	return &Service{database: connection, ledger: ledgerService, rates: ratesService, auth: authService, providers: registry, dispatcher: dispatcher, toolkit: toolkit, settings: settings}
+func NewService(connection *gorm.DB, ledgerService *ledger.Service, ratesService *rates.Service, authService *auth.Service, registry *providers.Registry, referralsService *referrals.Service, dispatcher *jobs.Dispatcher, toolkit *security.Toolkit, settings config.Config) *Service {
+	return &Service{database: connection, ledger: ledgerService, rates: ratesService, auth: authService, providers: registry, referrals: referralsService, dispatcher: dispatcher, toolkit: toolkit, settings: settings}
 }
 
 // nairaPerKwh is the illustrative electricity price used for the units shown.
@@ -84,17 +86,17 @@ type PayBillInput struct {
 // PayBill pays a bill with any asset, in two steps so the slow biller is
 // never called while database rows are locked:
 //
-//  1. In ONE transaction: take the money and park it in Purchases In
-//     Transit NGN, and save the transaction as "pending". (Paying with USD
-//     for a ₦5,000 bill posts a USD -> NGN conversion that lands there;
-//     paying with NGN is Dr User NGN / Cr Purchases In Transit NGN + fee.)
-//     The pending row is the "outbox": it is saved in the same commit as
-//     the money, so the purchase can never be forgotten.
+//  1. In ONE transaction: take the money, pay it out of the bills
+//     provider's Naira vault, and save the transaction as "pending".
+//     (Paying with NGN is Dr User NGN / Cr Bills provider vault NGN + fee;
+//     paying with USD for a ₦5,000 bill posts a USD -> NGN conversion whose
+//     target is that vault.) The pending row is the "outbox": it is saved in
+//     the same commit as the money, so the purchase can never be forgotten.
 //  2. After the commit, outside any transaction, ask the biller (see
-//     ProcessPurchase). It confirms -> Dr In Transit / Cr Company Vault NGN
-//     ("the money left the company"); it refuses -> the step-1 posting is
-//     reversed and the customer gets everything back; it does not answer ->
-//     the purchase stays pending and a queue job asks again.
+//     ProcessPurchase). It confirms -> the bill is completed (nothing more
+//     to post); it refuses -> the step-1 posting is reversed and the
+//     customer gets everything back; it does not answer -> the purchase
+//     stays pending and a queue job asks again.
 func (service *Service) PayBill(requestContext context.Context, actor shared.Actor, input PayBillInput) (*models.Transaction, error) {
 	if !input.SkipPin {
 		if err := service.auth.VerifyPin(requestContext, actor.UserID, input.Pin); err != nil {
@@ -141,8 +143,10 @@ func (service *Service) PayBill(requestContext context.Context, actor shared.Act
 	if _, err := service.providers.Bills(); err != nil {
 		return nil, err
 	}
-	// Opened outside the transaction (databases seeded before this account existed).
-	if _, err := service.ledger.EnsureCompanyAccount(requestContext, ledger.PurchaseInTransitTemplate(), "NGN"); err != nil {
+	// The biller may still refuse, so an inviter's share is only recorded
+	// now and paid when the biller confirms (settlePurchase).
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, false)
+	if err != nil {
 		return nil, err
 	}
 
@@ -151,19 +155,19 @@ func (service *Service) PayBill(requestContext context.Context, actor shared.Act
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
-		inTransit, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodePurchaseInTransit, "NGN")
+		billsVault, err := service.productVault(databaseTransaction, biller.ProviderID, models.ProviderCategoryUtilities, "NGN")
 		if err != nil {
 			return err
 		}
 		posting := ledger.ConversionPosting{
 			Reference: input.Reference + ":POST", TransactionType: "bill", Description: biller.Name + " " + input.Target,
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-			SourceAccountID: userWallet.ID, TargetAccountID: inTransit.ID,
+			SourceAccountID: userWallet.ID, TargetAccountID: billsVault.ID,
 			FromAsset: payWith, ToAsset: "NGN", Converted: cost, Fee: fee, Received: amountNgn,
-			Rates: service.rates.RatesFor(databaseTransaction, payWith, "NGN"),
+			Rates: service.rates.RatesFor(databaseTransaction, payWith, "NGN"), ReferralShare: invitation.ShareOf(),
 		}
 		if price != nil {
-			posting.NairaIn, posting.NairaOut = price.NairaIn, price.NairaOut
+			posting.NairaIn, posting.NairaOut, posting.MarketReceived = price.NairaIn, price.NairaOut, price.MarketReceived
 		}
 		postResult, err := service.ledger.PostConversion(databaseTransaction, posting)
 		if err != nil {
@@ -185,6 +189,9 @@ func (service *Service) PayBill(requestContext context.Context, actor shared.Act
 			Metadata: shared.JSON(metadata),
 		}
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, postResult); err != nil {
 			return err
 		}
 		if price != nil {

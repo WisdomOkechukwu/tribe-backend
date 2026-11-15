@@ -170,6 +170,23 @@ func NewKey() string {
 // returns a client for that phone. tag must be unique within the test.
 func (environment *Environment) RegisterUser(test *testing.T, tag string) *Client {
 	test.Helper()
+	return environment.register(test, tag, "")
+}
+
+// RegisterInvitedUser signs up a customer with an existing customer's
+// referral code, so they count as invited by them.
+func (environment *Environment) RegisterInvitedUser(test *testing.T, tag string, inviter *Client) *Client {
+	test.Helper()
+	var inviterRow models.User
+	if err := environment.App.Database.Where("email = ?", inviter.Email).Take(&inviterRow).Error; err != nil {
+		test.Fatalf("find inviter %s: %v", inviter.Email, err)
+	}
+	return environment.register(test, tag, inviterRow.ReferralCode)
+}
+
+// register signs a customer up through the real API (referralCode may be empty).
+func (environment *Environment) register(test *testing.T, tag string, referralCode string) *Client {
+	test.Helper()
 	client := environment.NewClient("phone-" + tag + "-" + randomHex(4))
 	email := tag + "." + environment.runID + "@example.com"
 	client.Email = email
@@ -188,7 +205,7 @@ func (environment *Environment) RegisterUser(test *testing.T, tag string) *Clien
 
 	registered := client.Call(test, http.MethodPost, "/api/mobile/v1/auth/register", map[string]any{
 		"email": email, "verification_token": tokenData.VerificationToken, "password": "Tribe@2026",
-		"first_name": "Test", "last_name": "User", "tag": tag, "country": "NG",
+		"first_name": "Test", "last_name": "User", "tag": tag, "country": "NG", "referral_code": referralCode,
 		"device": map[string]string{"imei": client.DeviceImei, "name": "Test phone", "platform": "ios"},
 	}, "")
 	if registered.Status != http.StatusCreated && registered.Status != http.StatusOK {

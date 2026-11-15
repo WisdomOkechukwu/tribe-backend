@@ -14,6 +14,7 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/services/auth"
 	"github.com/tribe-africa/tribe-backend/app/services/ledger"
 	"github.com/tribe-africa/tribe-backend/app/services/rates"
+	"github.com/tribe-africa/tribe-backend/app/services/referrals"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/database"
 	"github.com/tribe-africa/tribe-backend/pkg/ids"
@@ -26,12 +27,13 @@ type Service struct {
 	ledger     *ledger.Service
 	rates      *rates.Service
 	auth       *auth.Service
+	referrals  *referrals.Service
 	dispatcher *jobs.Dispatcher
 }
 
 // NewService creates the swaps service.
-func NewService(connection *gorm.DB, ledgerService *ledger.Service, ratesService *rates.Service, authService *auth.Service, dispatcher *jobs.Dispatcher) *Service {
-	return &Service{database: connection, ledger: ledgerService, rates: ratesService, auth: authService, dispatcher: dispatcher}
+func NewService(connection *gorm.DB, ledgerService *ledger.Service, ratesService *rates.Service, authService *auth.Service, referralsService *referrals.Service, dispatcher *jobs.Dispatcher) *Service {
+	return &Service{database: connection, ledger: ledgerService, rates: ratesService, auth: authService, referrals: referralsService, dispatcher: dispatcher}
 }
 
 // SwapInput is what the confirm button sends.
@@ -44,12 +46,16 @@ type SwapInput struct {
 // Swap executes a quoted swap. Step by step:
 //
 //  1. Check the PIN (outside the transaction so wrong tries are counted).
-//  2. Make sure the user has a wallet for the target asset.
+//  2. Make sure the user has a wallet for the target asset, and (when they
+//     were invited) the accounts their inviter's referral share needs.
 //  3. In ONE transaction:
 //     a. re-check the user and phone (shared locks),
 //     b. use the quote (only once, only before it expires),
-//     c. post the journal entry (this locks the wallets and checks the balance),
-//     d. save the transaction row and each route leg (swap_legs),
+//     c. post the journal entry (this locks the wallets and checks the
+//     balance); fee and margin go to the Earnings Vault, and an inviter's
+//     share of them to their referral balance,
+//     d. save the transaction row, each route leg (swap_legs) and the
+//     referral earning,
 //     e. add an inbox message.
 //  4. After commit: queue a push notification.
 //
@@ -74,6 +80,11 @@ func (service *Service) Swap(requestContext context.Context, actor shared.Actor,
 		return nil, err
 	}
 	decimals := shared.AssetDecimals(service.database.WithContext(requestContext))
+	// A swap is final as soon as it is posted, so an inviter's share is paid at once.
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, true)
+	if err != nil {
+		return nil, err
+	}
 
 	transaction := &models.Transaction{ID: ids.New(), Reference: input.Reference, UserID: actor.UserID}
 	err = database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
@@ -87,12 +98,7 @@ func (service *Service) Swap(requestContext context.Context, actor shared.Actor,
 		totalPaid, _ := money.ParseUnits(quote.FromAmount)
 		fee, _ := money.ParseUnits(quote.FeeAmount)
 		received, _ := money.ParseUnits(quote.ToAmount)
-		var nairaIn, nairaOut *money.Amount
-		if quote.NairaInAmount != nil && quote.NairaOutAmount != nil {
-			parsedIn, _ := money.ParseUnits(*quote.NairaInAmount)
-			parsedOut, _ := money.ParseUnits(*quote.NairaOutAmount)
-			nairaIn, nairaOut = &parsedIn, &parsedOut
-		}
+		nairaIn, nairaOut, marketReceived := rates.MarginAmountsOf(quote)
 
 		result, err := service.ledger.PostConversion(databaseTransaction, ledger.ConversionPosting{
 			Reference: input.Reference + ":POST", TransactionType: "swap",
@@ -101,9 +107,10 @@ func (service *Service) Swap(requestContext context.Context, actor shared.Actor,
 			SourceAccountID:       sourceWallet.ID, TargetAccountID: targetWallet.ID,
 			FromAsset: quote.FromAsset, ToAsset: quote.ToAsset,
 			Converted: totalPaid.Subtract(fee), Fee: fee, Received: received,
-			NairaIn: nairaIn, NairaOut: nairaOut,
-			Rates:    service.rates.RatesFor(databaseTransaction, quote.FromAsset, quote.ToAsset, "NGN"),
-			Metadata: map[string]any{"quote_id": quote.ID, "uses_ngn_rail": quote.UsesNgnRail},
+			NairaIn: nairaIn, NairaOut: nairaOut, MarketReceived: marketReceived,
+			Rates:         service.rates.RatesFor(databaseTransaction, quote.FromAsset, quote.ToAsset, "NGN"),
+			Metadata:      map[string]any{"quote_id": quote.ID, "uses_ngn_rail": quote.UsesNgnRail},
+			ReferralShare: invitation.ShareOf(),
 		})
 		if err != nil {
 			return err
@@ -124,6 +131,9 @@ func (service *Service) Swap(requestContext context.Context, actor shared.Actor,
 			return err
 		}
 		if err := SaveSwapLegs(databaseTransaction, transaction.ID, &quote.ID, rates.RouteOf(quote)); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, result); err != nil {
 			return err
 		}
 		return shared.Notify(databaseTransaction, actor.UserID, "swap", "Swap complete",

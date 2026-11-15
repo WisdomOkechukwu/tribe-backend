@@ -144,8 +144,11 @@ func TestSameIdempotencyKeyPostsOnce(test *testing.T) {
 	if distinct != 1 {
 		test.Errorf("%d different swap transactions were returned, want 1", distinct)
 	}
+	// Only this user's swaps: the seeder posts a demo swap of its own.
+	var swapUser models.User
+	environment.App.Database.Where("email = ?", user.Email).Take(&swapUser)
 	var swapEntries int64
-	environment.App.Database.Model(&models.JournalEntry{}).Where("transaction_type = ?", "swap").Count(&swapEntries)
+	environment.App.Database.Model(&models.JournalEntry{}).Where("transaction_type = ? AND created_by = ?", "swap", "user:"+swapUser.ID).Count(&swapEntries)
 	if swapEntries != 1 {
 		test.Errorf("%d swap journal entries were posted, want 1", swapEntries)
 	}
@@ -242,8 +245,11 @@ func TestTwoPhonesTakingOverAtOnce(test *testing.T) {
 	}
 }
 
-// assertBooksBalance runs the same check as `artisan ledger:verify`: every
-// journal entry balances and every snapshot matches its legs.
+// assertBooksBalance runs the same check as `artisan ledger:verify` (every
+// journal entry balances and every snapshot matches its legs), then checks
+// the rule the provider-vault ledger rests on: in every currency, what the
+// providers hold minus what we owe customers is exactly Tribe Funds. It also
+// checks the card issuer holds exactly the money on the cards.
 func assertBooksBalance(test *testing.T, environment *testenv.Environment) {
 	test.Helper()
 	problems, err := environment.App.Ledger.Verify(context.Background())
@@ -252,5 +258,31 @@ func assertBooksBalance(test *testing.T, environment *testenv.Environment) {
 	}
 	for _, problem := range problems {
 		test.Errorf("ledger problem: %+v", problem)
+	}
+
+	var assetCodes []string
+	environment.App.Database.Model(&models.Asset{}).Pluck("code", &assetCodes)
+	freeByAsset, err := environment.App.Ledger.FreeFundsForAssets(environment.App.Database, assetCodes)
+	if err != nil {
+		test.Fatalf("free funds: %v", err)
+	}
+	for _, assetCode := range assetCodes {
+		free := freeByAsset[assetCode]
+		if free.Free.Compare(free.TribeFunds) != 0 {
+			test.Errorf("%s: provider vaults %s - owed %s = %s, but Tribe Funds is %s", assetCode,
+				free.Vaults.UnitsString(), free.Owed.UnitsString(), free.Free.UnitsString(), free.TribeFunds.UnitsString())
+		}
+	}
+
+	var issuerVault, cardBalances string
+	environment.App.Database.Raw(`SELECT COALESCE(SUM(CASE WHEN l.side = 'debit' THEN l.amount ELSE -l.amount END), 0)
+		  FROM journal_legs l JOIN ledger_accounts a ON a.id = l.ledger_account_id
+		  JOIN providers p ON a.owner_key = CONCAT('provider:', p.id)
+		 WHERE a.code = 'provider_vault' AND p.category = 'virtual_card' AND a.asset_code = 'USD'`).Scan(&issuerVault)
+	environment.App.Database.Raw(`SELECT COALESCE(SUM(CASE WHEN l.side = 'credit' THEN l.amount ELSE -l.amount END), 0)
+		  FROM journal_legs l JOIN ledger_accounts a ON a.id = l.ledger_account_id
+		 WHERE a.code = 'user_card' AND a.asset_code = 'USD'`).Scan(&cardBalances)
+	if issuerVault != cardBalances {
+		test.Errorf("the card issuer's USD vault holds %s, but the cards add up to %s", issuerVault, cardBalances)
 	}
 }

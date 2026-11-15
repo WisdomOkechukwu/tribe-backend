@@ -1244,10 +1244,10 @@ Every account has a **category**, and the category decides which side makes it g
 
 | Category | Goes up with | Examples |
 |---|---|---|
-| asset | debit | Company Vault (money we hold at banks and providers) |
+| asset | debit | Provider vaults (what each provider holds for Tribe) |
 | liability | credit | **User wallets** (money Tribe owes the user) |
-| revenue | credit | Fee Revenue, FX Margin Revenue |
-| expense | debit | Provider Expense, Referral Expense |
+| equity | credit | Tribe Funds (Tribe's own share: fees, margins, top-ups) |
+| expense | debit | Provider Expense |
 | equity | credit | Treasury Funding (owners' money) |
 
 The key point: **a user's wallet is a liability for Tribe**. When Ada receives money we **credit** her account; when she spends we **debit** it.
@@ -1258,7 +1258,7 @@ The key point: **a user's wallet is a liability for Tribe**. When Ada receives m
 |---|---|---|
 | Ada's USD wallet | 5.10 | |
 | Bola's USD wallet | | 5.00 |
-| Fee Revenue (USD) | | 0.10 |
+| Tribe Funds (USD) | | 0.10 |
 | **Total** | **5.10** | **5.10** |
 
 ### 8.3 Posting rules
@@ -1274,7 +1274,7 @@ func DepositLegs(companyVault uint64, userWallet uint64, amount money.Amount) []
 }
 ```
 
-Rules include `DepositLegs`, `TreasuryFundingLegs`, `InternalTransferLegs`, `PayoutStartLegs`, `PayoutSucceededLegs`, `PayoutFailedLegs`, `FeeLegs`, `MoveLegs` and, in [`conversion.go`](../app/services/ledger/conversion.go), `ConversionLegs` for swaps.
+Rules include `DepositLegs`, `TreasuryFundingLegs`, `InternalTransferLegs`, `PayoutLegs`, `PayoutFailedLegs`, `VaultTransferLegs`, `ReferralRewardLegs`, `FeeLegs`, `MoveLegs` and, in [`conversion.go`](../app/services/ledger/conversion.go), `ConversionLegs` for swaps.
 
 [`rules_test.go`](../app/services/ledger/rules_test.go) proves **every rule balances per currency**. A new rule needs a case there **and** a note in `ACCOUNTING.md`.
 
@@ -1315,13 +1315,9 @@ Ledger accounts are found by **code + asset** (and user, for user accounts). The
 | `user_primary` | a user | the user's wallet for one asset |
 | `user_card` | a user | balance loaded on one virtual card |
 | `user_referral` | a user | referral earnings waiting to be withdrawn |
-| `company_vault` | Tribe | money Tribe holds at banks and providers |
-| `treasury_funding` | Tribe | money the owners put in |
-| `payout_in_transit` | Tribe | money sent out that the provider has not confirmed |
-| `fee_revenue` | Tribe | fees charged |
-| `fx_margin_revenue` | Tribe | the Naira difference on NGN-rail conversions |
-| `swap_clearing` | Tribe | assets bought or sold in swaps, awaiting settlement |
-| `cashpoint_escrow` | Tribe | Naira held for unredeemed cashpoint codes |
+| `user_cashpoint` | a user | Naira set aside for the user's unredeemed cashpoint codes |
+| `provider_vault` | a provider | what that provider holds for Tribe in one currency |
+| `tribe_funds` | Tribe | Tribe's own share of the money at the providers: fees, margins, top-ups; credits and referral rewards are paid from it |
 
 `ledger.EnsureUserAccount` creates a user account the first time it is needed. `ledger.CompanyAccount` finds a company account inside a transaction.
 
@@ -1440,7 +1436,7 @@ Each handler decodes the JSON payload and calls a service. Return `nil` for succ
 | `php artisan queue:work` | `bin/worker` |
 | `failed_jobs` table, Horizon | asynq's Redis state, shown on the admin **Jobs** page (via `application.Inspector`) |
 
-**Example: sending to a bank.** The request posts `PayoutStartLegs` (wallet → Payouts In Transit), saves a `pending` transaction, queues `ProcessPayout`, and returns. The worker asks the provider. On success it posts `PayoutSucceededLegs` (In Transit → Vault). On failure, `PayoutFailedLegs` gives the money back to the user.
+**Example: sending to a bank.** The request posts `PayoutLegs` (wallet → the provider vault that pays it out), saves a `pending` transaction, queues `ProcessPayout`, and returns. The worker asks the provider. On success it just completes the transaction. On a refusal, `PayoutFailedLegs` puts the money back in the vault and the user's wallet.
 
 ### 10.2 Cron (the scheduler)
 
@@ -1912,7 +1908,7 @@ Both send `version: 3`. The first locks the row, sees version 3, writes with ver
 <details>
 <summary>10. A job handler calls a provider and then posts to the ledger. The worker crashes after the provider call but before the post. What protects the money?</summary>
 
-The job is delivered again. The money already sits safely in Payouts In Transit, so nothing is lost. The handler checks the transaction is still `pending` and calls the provider again with the **same reference** (a real provider adapter must treat a repeated reference as the same payout). It then posts inside a transaction that **locks** the transaction row and re-checks it is still pending. The journal reference (`<reference>:SETTLE`) is UNIQUE, so even a duplicate post cannot move money twice.
+The job is delivered again. The payout was posted once, when it started, so nothing is lost or doubled. The handler checks the transaction is still `pending` and calls the provider again with the **same reference** (a real provider adapter must treat a repeated reference as the same payout). It then finishes inside a transaction that **locks** the transaction row and re-checks it is still pending. A refund's journal reference (`<reference>:REFUND`) is UNIQUE, so even a duplicate cannot move money twice.
 </details>
 
 <details>

@@ -42,8 +42,8 @@ func registerAdminRoutes(router *gin.Engine, application *bootstrap.App) {
 	signedIn.GET("/customers/:id/api-requests", can("api.view"), controller.CustomerApiRequests)
 	signedIn.PATCH("/customers/:id/status", can("customers.freeze"), idempotent, controller.SetCustomerStatus)
 	signedIn.PUT("/customers/:id/labels", can("customers.labels"), idempotent, controller.SetCustomerLabels)
-	// Manual credits & debits need two admins too, and only a SUPER ADMIN approves. A credit only posts if the vault's FREE
-	// funds cover it; a debit only if the customer's wallet does.
+	// Manual credits & debits need two admins too, and only a SUPER ADMIN approves. A credit only posts if the currency's
+	// EARNINGS VAULT covers it; a debit only if the customer's wallet does.
 	signedIn.POST("/customers/:id/adjustments", can("adjustments.request"), idempotent, controller.CreateCustomerAdjustment)
 	signedIn.GET("/customer-adjustments", can("inventory.view"), controller.CustomerAdjustments)
 	signedIn.POST("/customer-adjustments/:id/approve", can("adjustments.approve"), idempotent, controller.ApproveCustomerAdjustment)
@@ -66,6 +66,9 @@ func registerAdminRoutes(router *gin.Engine, application *bootstrap.App) {
 	signedIn.PUT("/rate-margins/:asset", can("markups.edit"), idempotent, controller.UpdateRateMargin)
 	signedIn.GET("/transaction-fees", can("markups.view"), controller.TransactionFees)
 	signedIn.PUT("/transaction-fees/:type", can("markups.edit"), idempotent, controller.UpdateTransactionFee)
+	// The referral share: the percent of what Tribe earns on an invited customer's transaction paid to the inviter.
+	signedIn.GET("/referral-settings", can("markups.view"), controller.ReferralSettings)
+	signedIn.PUT("/referral-settings", can("markups.edit"), idempotent, controller.UpdateReferralSettings)
 
 	// Inventory & ledger
 	signedIn.GET("/inventory", can("inventory.view"), controller.Inventory)

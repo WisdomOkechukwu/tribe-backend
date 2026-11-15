@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"sort"
 	"time"
@@ -24,6 +25,7 @@ type Leg struct {
 	Side      string // Debit or Credit
 	Amount    money.Amount
 	Memo      string
+	Source    string // Tribe Funds legs only: SourceFee, SourceMargin, SourceAdjustment, SourceTreasury or SourceReferralReward
 }
 
 // AssetRate is the USD and NGN value of one whole unit of an asset, stored
@@ -47,12 +49,32 @@ type Entry struct {
 	Metadata              map[string]any
 	Rates                 map[string]AssetRate // optional: asset code -> rates at posting time
 	Legs                  []Leg
+	// ReferralShare, when set, works out the inviter's share of what this
+	// entry earns (see referralShareLegs) and, with PayNow, pays it from Tribe
+	// Funds NGN in this entry. Rates must then hold the NGN rate of every
+	// currency the entry earns in.
+	ReferralShare *ReferralShare
+}
+
+// ReferralShare is the part of an invited customer's transaction that goes
+// to the person who invited them.
+type ReferralShare struct {
+	Percent          *big.Rat // percent of the earnings, e.g. 2 for 2%
+	InviterAccountID uint64   // the inviter's referral balance (user_referral NGN)
+	// PayNow pays the share into the inviter's referral balance in this same
+	// entry. Leave it false while the customer's transaction can still be
+	// refused by a provider: the share is then only recorded (referrals
+	// service, "accrued") and paid when the transaction completes.
+	PayNow bool
 }
 
 // PostResult is what Post returns.
 type PostResult struct {
 	Entry         *models.JournalEntry
 	AlreadyPosted bool // true when this reference was posted before (nothing new was written)
+	// ReferralShareNgn is the inviter's share of this entry's earnings, in
+	// kobo (zero when it had no ReferralShare, or earned too little for one).
+	ReferralShareNgn money.Amount
 }
 
 // Post writes a journal entry and its legs. It MUST be called inside
@@ -61,6 +83,7 @@ type PostResult struct {
 //
 // Steps:
 //  1. Check the legs make sense (at least 2, amounts > 0, debits = credits per asset).
+//     When the entry carries a ReferralShare, add the legs that move it.
 //  2. Insert the entry header. If the reference already exists, stop: it was
 //     already posted (idempotency).
 //  3. Lock every account the legs touch, in ascending id order (FOR UPDATE).
@@ -71,6 +94,21 @@ type PostResult struct {
 func (service *Service) Post(databaseTransaction *gorm.DB, entry Entry) (*PostResult, error) {
 	if err := validateLegs(entry.Legs); err != nil {
 		return nil, err
+	}
+	referralShareNgn := money.Zero()
+	if entry.ReferralShare != nil {
+		shareLegs, shareNgn, err := service.referralShareLegs(databaseTransaction, entry)
+		if err != nil {
+			return nil, err
+		}
+		entry.Legs = append(entry.Legs, shareLegs...)
+		referralShareNgn = shareNgn
+		if shareNgn.IsPositive() {
+			if entry.Metadata == nil {
+				entry.Metadata = map[string]any{}
+			}
+			entry.Metadata["referral_share_ngn"] = shareNgn.UnitsString()
+		}
 	}
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
@@ -177,6 +215,10 @@ func (service *Service) Post(databaseTransaction *gorm.DB, entry Entry) (*PostRe
 			Memo:            truncate(leg.Memo, 150),
 			CreatedAt:       now,
 		}
+		if leg.Source != "" {
+			source := leg.Source
+			row.EarningSource = &source
+		}
 		if rate, found := entry.Rates[account.AssetCode]; found {
 			usdRate, ngnRate := rate.Usd, rate.Ngn
 			row.UsdRate, row.NgnRate = &usdRate, &ngnRate
@@ -186,7 +228,7 @@ func (service *Service) Post(databaseTransaction *gorm.DB, entry Entry) (*PostRe
 	if err := databaseTransaction.Create(&legRows).Error; err != nil {
 		return nil, err
 	}
-	return &PostResult{Entry: &header}, nil
+	return &PostResult{Entry: &header, ReferralShareNgn: referralShareNgn}, nil
 }
 
 // Reverse posts the exact opposite of an existing entry (every debit becomes
@@ -207,7 +249,11 @@ func (service *Service) Reverse(databaseTransaction *gorm.DB, originalEntryID st
 		if err != nil {
 			return nil, err
 		}
-		legs = append(legs, Leg{AccountID: originalLeg.LedgerAccountID, Side: originalLeg.Side, Amount: amount, Memo: originalLeg.Memo})
+		source := ""
+		if originalLeg.EarningSource != nil {
+			source = *originalLeg.EarningSource
+		}
+		legs = append(legs, Leg{AccountID: originalLeg.LedgerAccountID, Side: originalLeg.Side, Amount: amount, Memo: originalLeg.Memo, Source: source})
 	}
 	reversedLegs := ReversalLegs(legs)
 	originalID := original.ID

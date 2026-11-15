@@ -1,6 +1,14 @@
-# Vaults: a proposal (not built yet)
+# Vaults: the proposal (superseded on 2026-11-15)
 
-> **Status:** proposal, waiting for the owner's answers to the four questions in §4. Nothing in this page has changed the ledger. `docs/ACCOUNTING.md` still describes what the code does today.
+> **Status:** superseded the same day by **provider vaults** (`docs/ACCOUNTING.md`): the owner decided the providers, not Tribe, hold the money, so the ledger now has only provider vaults, customer balances and Tribe Funds. The Earnings and Referral Vaults below were built and then removed; the referral percentage rule (answer 4) was kept, paid from Tribe Funds with no pot. This page is kept for the history of the decision.
+>
+> **The owner's answers (2026-11-15):**
+> 1. Customer credits come from the **Earnings Vault**, refused when it is short.
+> 2. **One** Earnings Vault per currency; the source (fee, margin, referral share, adjustment) is a tag on each leg.
+> 3. The Referral Vault is **funded automatically** by each transaction of an invited customer: the referral share (an admin setting, 2% to start) of what Tribe earned goes to it, the rest stays in the Earnings Vault, and the vault pays the inviter. There is no admin "fund the pot" flow, and customers nobody invited fund nothing.
+> 4. There is **no flat ₦25**. The reward is the referral share of the earnings, converted to Naira at the market rate. It applies to every kind of earning transaction; a share under one smallest unit rounds down to nothing, so tiny transactions cannot farm it.
+>
+> The local `tribe_core` database was rebuilt from scratch for this change (no opening-balance entries were needed).
 
 The request: because money really sits with providers, the books should be organised around **vaults**: one per currency that mirrors what the provider holds, one for company earnings, one for referral earnings, and customers are credited from a vault.
 

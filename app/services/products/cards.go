@@ -439,6 +439,11 @@ func (service *Service) CreateCard(requestContext context.Context, actor shared.
 	if err != nil {
 		return nil, nil, err
 	}
+	// Opened before the card is issued, so a failure here issues nothing.
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, true)
+	if err != nil {
+		return nil, nil, err
+	}
 	issued, err := issuer.IssueCard(requestContext, cardID, user.FullName(), input.Network)
 	if err != nil {
 		return nil, nil, apperrors.New(http.StatusBadGateway, "PROVIDER_FAILED", "The card issuer did not respond. Try again.")
@@ -461,15 +466,21 @@ func (service *Service) CreateCard(requestContext context.Context, actor shared.
 		if err := databaseTransaction.Create(&card).Error; err != nil {
 			return err
 		}
+		// The top-up's dollars go to the card issuer, which holds every card's money.
+		toIssuer, err := service.cardMoneyLegs(databaseTransaction, "USD", topUp, true)
+		if err != nil {
+			return err
+		}
 		posting := ledger.ConversionPosting{
+			ExtraLegs: toIssuer,
 			Reference: input.Reference + ":POST", TransactionType: "card_create", Description: "New card " + input.Label,
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
 			SourceAccountID: sourceWallet.ID, TargetAccountID: cardAccount.ID,
 			FromAsset: input.PayWith, ToAsset: "USD", Converted: converted, Fee: fee, Received: topUp,
-			Rates: service.rates.RatesFor(databaseTransaction, input.PayWith, "USD", "NGN"),
+			Rates: service.rates.RatesFor(databaseTransaction, input.PayWith, "USD", "NGN"), ReferralShare: invitation.ShareOf(),
 		}
 		if price != nil {
-			posting.NairaIn, posting.NairaOut = price.NairaIn, price.NairaOut
+			posting.NairaIn, posting.NairaOut, posting.MarketReceived = price.NairaIn, price.NairaOut, price.MarketReceived
 		}
 		postResult, err := service.ledger.PostConversion(databaseTransaction, posting)
 		if err != nil {
@@ -485,6 +496,9 @@ func (service *Service) CreateCard(requestContext context.Context, actor shared.
 			Metadata: shared.JSON(map[string]any{"card_id": card.ID, "card_op": "created", "network": input.Network}),
 		}
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, postResult); err != nil {
 			return err
 		}
 		if price != nil {
@@ -568,8 +582,13 @@ func (service *Service) WithdrawCard(requestContext context.Context, actor share
 // postCardMovement is the shared "move money to/from a card" transaction.
 func (service *Service) postCardMovement(requestContext context.Context, actor shared.Actor, card *models.VirtualCard, transactionType string, cardOperation string, title string, reference string,
 	sourceAccountID uint64, targetAccountID uint64, fromAsset string, toAsset string, converted money.Amount, fee money.Amount, received money.Amount, price *rates.Price) (*models.Transaction, error) {
+	// Moving money on a card is final at once, so an inviter's share is paid at once.
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, true)
+	if err != nil {
+		return nil, err
+	}
 	transaction := &models.Transaction{ID: ids.New(), Reference: reference, UserID: actor.UserID}
-	err := database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
+	err = database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
@@ -581,15 +600,25 @@ func (service *Service) postCardMovement(requestContext context.Context, actor s
 		if lockedCard.Frozen && transactionType == "card_fund" {
 			return apperrors.New(http.StatusUnprocessableEntity, "CARD_FROZEN", "Unfreeze the card first.")
 		}
+		// Funding sends the dollars that land on the card to the card issuer;
+		// a withdrawal brings everything taken off the card back from it.
+		cardMoney, err := service.cardMoneyLegs(databaseTransaction, lockedCard.Currency, received, true)
+		if transactionType == "card_withdraw" {
+			cardMoney, err = service.cardMoneyLegs(databaseTransaction, lockedCard.Currency, converted.Add(fee), false)
+		}
+		if err != nil {
+			return err
+		}
 		posting := ledger.ConversionPosting{
+			ExtraLegs: cardMoney,
 			Reference: reference + ":POST", TransactionType: transactionType, Description: title,
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
 			SourceAccountID: sourceAccountID, TargetAccountID: targetAccountID,
 			FromAsset: fromAsset, ToAsset: toAsset, Converted: converted, Fee: fee, Received: received,
-			Rates: service.rates.RatesFor(databaseTransaction, fromAsset, toAsset, "NGN"),
+			Rates: service.rates.RatesFor(databaseTransaction, fromAsset, toAsset, "NGN"), ReferralShare: invitation.ShareOf(),
 		}
 		if price != nil {
-			posting.NairaIn, posting.NairaOut = price.NairaIn, price.NairaOut
+			posting.NairaIn, posting.NairaOut, posting.MarketReceived = price.NairaIn, price.NairaOut, price.MarketReceived
 		}
 		postResult, err := service.ledger.PostConversion(databaseTransaction, posting)
 		if err != nil {
@@ -609,6 +638,9 @@ func (service *Service) postCardMovement(requestContext context.Context, actor s
 			Metadata: shared.JSON(map[string]any{"card_id": lockedCard.ID, "card_op": cardOperation}),
 		}
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, postResult); err != nil {
 			return err
 		}
 		if err := shared.NotifyTransaction(databaseTransaction, transaction, "card", title); err != nil {
@@ -772,10 +804,15 @@ func (service *Service) DeleteCard(requestContext context.Context, actor shared.
 		}
 		var journalEntryID *string
 		if balance.IsPositive() {
+			// The card issuer sends the card's dollars back to the home provider.
+			returned, err := service.cardMoneyLegs(databaseTransaction, cardAccount.AssetCode, balance, false)
+			if err != nil {
+				return err
+			}
 			result, err := service.ledger.Post(databaseTransaction, ledger.Entry{
 				Reference: reference + ":POST", TransactionType: "card_delete", Description: "Card closed, balance returned",
 				CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-				Legs: ledger.MoveLegs(cardAccount.ID, usdWallet.ID, balance, "Card closed"),
+				Legs: append(ledger.MoveLegs(cardAccount.ID, usdWallet.ID, balance, "Card closed"), returned...),
 			})
 			if err != nil {
 				return err

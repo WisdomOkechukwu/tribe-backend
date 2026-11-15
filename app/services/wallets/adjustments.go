@@ -16,13 +16,8 @@ import (
 	"github.com/tribe-africa/tribe-backend/pkg/money"
 )
 
-// customerAdjustmentsTemplate is the expense account manual credits and
-// debits are booked to. It is created on first use, so databases seeded
-// before it existed work.
-var customerAdjustmentsTemplate = ledger.CompanyAccountTemplate{Code: ledger.CodeCustomerAdjustments, Name: "Customer Adjustments", Category: ledger.CategoryExpense}
-
 // RequestCustomerAdjustment records that an admin wants to credit a customer
-// from the company's free funds, or debit money back out of their wallet (the
+// from the currency's Tribe Funds, or debit money back out of their wallet (the
 // admin "Credit" / "Debit" buttons on a customer). Nothing is posted yet: it
 // waits as "pending" until a DIFFERENT admin approves it (see
 // ApproveCustomerAdjustment). The limit is checked here too, so an impossible
@@ -64,10 +59,10 @@ func (service *Service) RequestCustomerAdjustment(requestContext context.Context
 // In ONE database transaction it:
 //
 //  1. locks the request and checks it is still pending and raised by someone else;
-//  2. locks this currency's Customer Adjustments account. Only adjustments
-//     touch that account, so two approvals in the same currency queue up here
-//     and the second one sees the first one's effect on the limit;
-//  3. re-checks the limit (credit: the vault's free funds; debit: the wallet);
+//  2. locks this currency's Tribe Funds. Two approvals in the same
+//     currency queue up here, and the second one sees the first one's
+//     effect on the limit;
+//  3. re-checks the limit (credit: Tribe Funds; debit: the wallet);
 //  4. posts the legs, records the transaction the customer sees in History,
 //     and writes their inbox message.
 func (service *Service) ApproveCustomerAdjustment(requestContext context.Context, adminID string, adminName string, approverIsSuperAdmin bool, adjustmentID string) (*models.CustomerAdjustment, error) {
@@ -84,7 +79,7 @@ func (service *Service) ApproveCustomerAdjustment(requestContext context.Context
 	if err != nil {
 		return nil, err
 	}
-	expense, err := service.ledger.EnsureCompanyAccount(requestContext, customerAdjustmentsTemplate, asset.Code)
+	tribeFunds, err := service.ledger.TribeFunds(service.database.WithContext(requestContext), asset.Code)
 	if err != nil {
 		return nil, err
 	}
@@ -98,8 +93,9 @@ func (service *Service) ApproveCustomerAdjustment(requestContext context.Context
 		if err := lockPendingAdjustment(databaseTransaction, &adjustment, adjustmentID, adminID); err != nil {
 			return err
 		}
-		var lockedExpense models.LedgerAccount
-		if err := database.LockForUpdate(databaseTransaction, &lockedExpense, "id = ?", expense.ID); err != nil {
+		// Locked here, then again (harmlessly, same transaction) by ledger.Post.
+		var lockedFunds models.LedgerAccount
+		if err := database.LockForUpdate(databaseTransaction, &lockedFunds, "id = ?", tribeFunds.ID); err != nil {
 			return err
 		}
 		amount, err := money.ParseUnits(adjustment.Amount)
@@ -116,11 +112,11 @@ func (service *Service) ApproveCustomerAdjustment(requestContext context.Context
 			FromAsset: asset.Code, FromAmount: amount.UnitsString(),
 			UsdValue: service.rates.UsdValueOf(databaseTransaction, asset.Code, amount, asset.DecimalPlaces),
 		}
-		legs := ledger.CustomerCreditLegs(expense.ID, userWallet.ID, amount)
+		legs := ledger.CustomerCreditLegs(tribeFunds.ID, userWallet.ID, amount)
 		inboxBody := amount.Display(asset.DecimalPlaces) + " " + asset.Code + " from Tribe was added to your wallet."
 		if adjustment.Kind == models.AdjustmentDebit {
 			// ledger.Post refuses to take a user wallet below zero (INSUFFICIENT_FUNDS).
-			legs = ledger.CustomerDebitLegs(userWallet.ID, expense.ID, amount)
+			legs = ledger.CustomerDebitLegs(userWallet.ID, tribeFunds.ID, amount)
 			transaction.Type, transaction.Direction, transaction.Title = "adjustment", "out", "Adjustment by Tribe"
 			inboxBody = amount.Display(asset.DecimalPlaces) + " " + asset.Code + " was taken from your wallet by Tribe: " + adjustment.Reason
 		} else {
@@ -204,9 +200,11 @@ func lockPendingAdjustment(databaseTransaction *gorm.DB, adjustment *models.Cust
 	return nil
 }
 
-// checkAdjustmentLimit refuses a credit bigger than the currency's free funds
-// (INSUFFICIENT_FREE_FUNDS), or a debit bigger than the customer's wallet
-// balance (INSUFFICIENT_FUNDS). query is the transaction when approving.
+// checkAdjustmentLimit refuses a credit bigger than the currency's Tribe
+// Funds (INSUFFICIENT_TRIBE_FUNDS): credits are paid from Tribe's own share
+// of the money at the providers, never from another customer's money. It also
+// refuses a debit bigger than the customer's wallet balance (INSUFFICIENT_FUNDS).
+// query is the transaction when approving.
 func (service *Service) checkAdjustmentLimit(query *gorm.DB, kind string, userID string, asset *models.Asset, amount money.Amount) error {
 	if kind == models.AdjustmentDebit {
 		walletBalance := money.Zero()
@@ -224,17 +222,20 @@ func (service *Service) checkAdjustmentLimit(query *gorm.DB, kind string, userID
 		return nil
 	}
 
-	free, err := service.ledger.FreeFundsOf(query, asset.Code)
+	tribeFunds, err := service.ledger.TribeFunds(query, asset.Code)
 	if err != nil {
 		return err
 	}
-	if amount.Compare(free.Free) > 0 {
-		available := free.Free
+	available, err := service.ledger.BalanceInQuery(query, *tribeFunds)
+	if err != nil {
+		return err
+	}
+	if amount.Compare(available) > 0 {
 		if available.IsNegative() {
 			available = money.Zero()
 		}
-		return apperrors.New(http.StatusUnprocessableEntity, "INSUFFICIENT_FREE_FUNDS",
-			"Only "+available.Decimal(asset.DecimalPlaces)+" "+asset.Code+" is free in the vault. Fund the vault first.")
+		return apperrors.New(http.StatusUnprocessableEntity, "INSUFFICIENT_TRIBE_FUNDS",
+			"Only "+available.Decimal(asset.DecimalPlaces)+" "+asset.Code+" of Tribe's own money is at the providers. Record treasury funding first.")
 	}
 	return nil
 }

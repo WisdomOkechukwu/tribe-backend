@@ -76,25 +76,43 @@ func NormalSideForCategory(category string) string {
 }
 
 // Account codes. A code + an asset + an owner identifies one account.
+//
+// The chart has only three kinds of account, because the PROVIDERS hold the
+// money and Tribe only keeps track of it:
+//
+//	provider vaults (asset)       what each provider holds for us, per currency
+//	customer balances (liability) what Tribe owes its customers
+//	Tribe Funds (equity)          Tribe's own share of the money in the vaults
+//
+// Every entry balances per currency, so for each currency:
+//
+//	Tribe Funds = sum of the provider vaults - everything owed to customers
 const (
 	// Accounts that belong to a user.
-	CodeUserPrimary  = "user_primary"  // the user's wallet balance for one asset
-	CodeUserReferral = "user_referral" // referral earnings (NGN) waiting to be withdrawn
-	CodeUserCard     = "user_card"     // the balance loaded on one virtual card (USD)
+	CodeUserPrimary   = "user_primary"   // the user's wallet balance for one asset
+	CodeUserReferral  = "user_referral"  // referral earnings (NGN) waiting to be withdrawn
+	CodeUserCard      = "user_card"      // the balance loaded on one virtual card (USD)
+	CodeUserCashpoint = "user_cashpoint" // Naira the user set aside for cashpoint codes not yet redeemed
 
-	// Accounts that belong to the company (one per asset).
-	CodeCompanyVault        = "company_vault"        // money the company holds at providers and banks
-	CodeTreasuryFunding     = "treasury_funding"     // money the owners put into the business
-	CodeSwapClearing        = "swap_clearing"        // assets bought/sold during swaps, waiting for settlement
-	CodePayoutInTransit     = "payout_in_transit"    // money sent out that a provider has not confirmed yet
-	CodePurchaseInTransit   = "purchase_in_transit"  // bills and gift cards paid for, not yet confirmed by the provider
-	CodeFeeRevenue          = "fee_revenue"          // fees we charge
-	CodeFxMarginRevenue     = "fx_margin_revenue"    // the difference between the Naira we receive and pay on the NGN rail
-	CodeProviderExpense     = "provider_expense"     // what providers charge us
-	CodeReferralExpense     = "referral_expense"     // money we pay users for inviting friends
-	CodeCustomerAdjustments = "customer_adjustments" // manual credits (and debits back) admins make to customer wallets
-	CodeCashpointEscrow     = "cashpoint_escrow"     // Naira held for cashpoint codes not yet redeemed
-	CodeSummary             = "summary"              // used when closing revenue and expenses at period end
+	// One per provider per currency it handles (provider_assets).
+	CodeProviderVault = "provider_vault" // what that provider holds for Tribe in that currency
+
+	// One per currency (CompanyAccountTemplates).
+	CodeTribeFunds = "tribe_funds" // Tribe's own money in the vaults: fees, margins, treasury top-ups
+)
+
+// ReferralAsset is the currency referral rewards are counted and paid in.
+// Every share is converted to Naira at the market rate when it is earned.
+const ReferralAsset = "NGN"
+
+// Where a Tribe Funds leg came from. It is stored on the leg
+// (journal_legs.earning_source) so one account can still be split in reports.
+const (
+	SourceFee            = "fee"             // a fee the customer paid
+	SourceMargin         = "margin"          // our spread on a conversion
+	SourceAdjustment     = "adjustment"      // a manual credit or debit made by admins
+	SourceTreasury       = "treasury"        // the owners topped up a provider vault
+	SourceReferralReward = "referral_reward" // an inviter's share, paid out of Tribe Funds
 )
 
 // CompanyAccountTemplate describes one company account created for every asset.
@@ -104,39 +122,23 @@ type CompanyAccountTemplate struct {
 	Category string
 }
 
-// CompanyAccountTemplates is the company chart of accounts. The seeder
-// creates one of each for every asset.
+// CompanyAccountTemplates is the company chart of accounts: the seeder
+// creates one of each for every asset. It is only Tribe Funds now; the
+// money itself is in the provider vaults (EnsureProviderVault).
 var CompanyAccountTemplates = []CompanyAccountTemplate{
-	{CodeCompanyVault, "Company Vault", CategoryAsset},
-	{CodeTreasuryFunding, "Treasury Funding", CategoryEquity},
-	{CodeSwapClearing, "Swap Clearing", CategorySuspenseLiability},
-	{CodePayoutInTransit, "Payouts In Transit", CategorySuspenseLiability},
-	{CodePurchaseInTransit, "Purchases In Transit", CategorySuspenseLiability},
-	{CodeFeeRevenue, "Fee Revenue", CategoryRevenue},
-	{CodeFxMarginRevenue, "FX Margin Revenue", CategoryRevenue},
-	{CodeProviderExpense, "Provider Expense", CategoryExpense},
-	{CodeReferralExpense, "Referral Expense", CategoryExpense},
-	{CodeCustomerAdjustments, "Customer Adjustments", CategoryExpense},
-	{CodeCashpointEscrow, "Cashpoint Escrow", CategoryLiability},
-	{CodeSummary, "Income Summary", CategorySummary},
-}
-
-// PurchaseInTransitTemplate is the template of Purchases In Transit, so
-// services can open it on databases seeded before it existed.
-func PurchaseInTransitTemplate() CompanyAccountTemplate {
-	for _, template := range CompanyAccountTemplates {
-		if template.Code == CodePurchaseInTransit {
-			return template
-		}
-	}
-	panic("purchase_in_transit is missing from CompanyAccountTemplates")
+	{CodeTribeFunds, "Tribe Funds", CategoryEquity},
 }
 
 // Owner keys.
 const ownerCompany = "company"
 
-func ownerKeyForUser(userID string) string { return "user:" + userID }
-func ownerKeyForCard(cardID string) string { return "card:" + cardID }
+func ownerKeyForUser(userID string) string         { return "user:" + userID }
+func ownerKeyForCard(cardID string) string         { return "card:" + cardID }
+func ownerKeyForProvider(providerID string) string { return "provider:" + providerID }
+
+// ProviderOwnerPrefix starts the owner key of every provider vault
+// ("provider:<provider id>"), for queries that list them all.
+const ProviderOwnerPrefix = "provider:"
 
 // Service is the ledger engine. Create one with NewService and share it.
 type Service struct {
@@ -164,12 +166,31 @@ func (service *Service) EnsureCompanyAccount(requestContext context.Context, tem
 	})
 }
 
+// EnsureProviderVault creates the vault that mirrors what one provider holds
+// for Tribe in one currency, if it does not exist yet. Used by the seeder and
+// when an admin adds a currency (safe to run many times).
+//
+// A vault may go below zero: that means we told the provider to pay more than
+// we had funded with it, and an admin must top it up (Inventory shows it).
+func (service *Service) EnsureProviderVault(requestContext context.Context, provider models.Provider, assetCode string) (*models.LedgerAccount, error) {
+	return service.ensureAccount(requestContext, models.LedgerAccount{
+		OwnerKey:      ownerKeyForProvider(provider.ID),
+		Code:          CodeProviderVault,
+		Name:          provider.Name + " · " + assetCode,
+		Category:      CategoryAsset,
+		NormalSide:    NormalSideForCategory(CategoryAsset),
+		AssetCode:     assetCode,
+		AccountType:   CodeProviderVault,
+		AllowNegative: true,
+	})
+}
+
 // EnsureUserAccount makes sure a user has a wallet account for an asset.
 // IMPORTANT: call this BEFORE starting a posting transaction, never inside
 // one. Creating rows inside a money transaction can cause MySQL "gap lock"
 // deadlocks when many users post at once.
 func (service *Service) EnsureUserAccount(requestContext context.Context, userID string, code string, assetCode string) (*models.LedgerAccount, error) {
-	names := map[string]string{CodeUserPrimary: "Wallet", CodeUserReferral: "Referral earnings"}
+	names := map[string]string{CodeUserPrimary: "Wallet", CodeUserReferral: "Referral earnings", CodeUserCashpoint: "Cashpoint codes"}
 	userIDCopy := userID
 	return service.ensureAccount(requestContext, models.LedgerAccount{
 		OwnerKey:    ownerKeyForUser(userID),
@@ -243,7 +264,35 @@ func (service *Service) findAccount(query *gorm.DB, ownerKey string, code string
 	return &account, nil
 }
 
-// CompanyAccount loads a company account, e.g. CompanyAccount(query, CodeFeeRevenue, "NGN").
+// ProviderVault loads one provider's vault for a currency.
+func (service *Service) ProviderVault(query *gorm.DB, providerID string, assetCode string) (*models.LedgerAccount, error) {
+	account, err := service.findAccount(query, ownerKeyForProvider(providerID), CodeProviderVault, assetCode)
+	if err != nil {
+		return nil, fmt.Errorf("provider vault %s/%s missing (run db:seed): %w", providerID, assetCode, err)
+	}
+	return account, nil
+}
+
+// HomeVault loads the vault of a currency's HOME provider: the provider that
+// converts it (assets.conversion_provider_id). Deposits, manual credits,
+// conversions and payouts of that currency use this vault.
+func (service *Service) HomeVault(query *gorm.DB, assetCode string) (*models.LedgerAccount, error) {
+	var asset models.Asset
+	if err := query.Select("code", "conversion_provider_id").Where("code = ?", assetCode).Take(&asset).Error; err != nil {
+		return nil, fmt.Errorf("asset %s: %w", assetCode, err)
+	}
+	if asset.ConversionProviderID == nil {
+		return nil, fmt.Errorf("asset %s has no provider, so no vault", assetCode)
+	}
+	return service.ProviderVault(query, *asset.ConversionProviderID, assetCode)
+}
+
+// TribeFunds loads Tribe's own account for a currency.
+func (service *Service) TribeFunds(query *gorm.DB, assetCode string) (*models.LedgerAccount, error) {
+	return service.CompanyAccount(query, CodeTribeFunds, assetCode)
+}
+
+// CompanyAccount loads a company account, e.g. CompanyAccount(query, CodeTribeFunds, "NGN").
 func (service *Service) CompanyAccount(query *gorm.DB, code string, assetCode string) (*models.LedgerAccount, error) {
 	account, err := service.findAccount(query, ownerCompany, code, assetCode)
 	if err != nil {

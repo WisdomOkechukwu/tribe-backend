@@ -3,7 +3,6 @@ package ledger
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"gorm.io/gorm"
 
@@ -223,170 +222,101 @@ func (service *Service) balancesOfAccounts(query *gorm.DB, accounts []models.Led
 	return balances, nil
 }
 
-// FreeFunds is how much of one currency the company may give away.
+// FreeFunds is one currency seen the way the providers see it:
 //
-//	Free = Company Vault - what we owe customers in that currency
+//	Vaults     everything the providers hold for us in that currency
+//	Owed       what we owe customers: every wallet, referral, card and cashpoint balance
+//	Free       Vaults - Owed: the money at the providers that is Tribe's own
+//	TribeFunds the Tribe Funds account's balance
 //
-// "What we owe customers" is every user wallet, referral balance and card
-// balance, plus Cashpoint Escrow, Payouts In Transit and Purchases In
-// Transit (customer money we are holding, sending, or spending on their
-// behalf but have not paid out yet). Swap Clearing is left out on purpose: it only
-// makes Free smaller, never bigger, so leaving it out is the careful choice.
+// Because every entry balances per currency, Free and TribeFunds are always
+// the same number, reached two ways. Showing both proves it: if they ever
+// differed, a posting would have broken the rules. Manual credits and
+// referral rewards are paid out of Tribe Funds.
 type FreeFunds struct {
-	AssetCode string
-	Vault     money.Amount
-	Owed      money.Amount
-	Free      money.Amount // may be negative when the vault is short
+	AssetCode  string
+	Vaults     money.Amount
+	Owed       money.Amount
+	Free       money.Amount // may be negative when the providers hold less than we owe
+	TribeFunds money.Amount
 }
 
-// FreeFundsOf adds up FreeFunds for one asset. Pass databaseTransaction
-// when calling inside a transaction (for example right before posting a
-// credit), so the read sees the same data as the posting.
-//
-// "Owed" is added up by MySQL in ONE statement over every customer wallet,
-// referral and card account in this currency, using the same method as
-// every other balance (latest snapshot + the legs after it). Before, this
-// was two queries per customer account: about 60,000 queries per admin page
-// at 10,000 customers, all while an approval held its locks.
-//
-// "newest" finds every account's latest snapshot date with one jump per
-// account through the UNIQUE (account, date) index (EXPLAIN: "Using index
-// for group-by"); it is not limited to this currency because that limit
-// would stop MySQL using this shortcut. The (asset_code, code) index then
-// picks only this currency's customer accounts.
-//
-// Because it is a single statement it also reads one consistent moment.
-// The result is grouped by normal side, because a snapshot's closing balance
-// is already "positive = normal side" while the later legs are raw debits
-// minus credits, which must be flipped for credit-normal accounts.
-func (service *Service) FreeFundsOf(query *gorm.DB, assetCode string) (FreeFunds, error) {
-	result := FreeFunds{AssetCode: assetCode, Vault: money.Zero(), Owed: money.Zero(), Free: money.Zero()}
-	vault, err := service.findAccount(query, ownerCompany, CodeCompanyVault, assetCode)
-	if err != nil {
-		return result, fmt.Errorf("company vault %s missing (run db:seed): %w", assetCode, err)
-	}
-	result.Vault, err = service.balanceOfAccount(query, *vault)
-	if err != nil {
-		return result, err
-	}
+// owedUserCodes are the customer accounts: money Tribe owes its customers.
+var owedUserCodes = []string{CodeUserPrimary, CodeUserReferral, CodeUserCard, CodeUserCashpoint}
 
-	var groups []struct {
-		NormalSide     string
-		SnapshotTotal  sql.NullString
-		NetDebitsTotal sql.NullString
-	}
-	err = query.Raw(`
-		SELECT owed.normal_side AS normal_side,
-		       SUM(COALESCE(owed.snapshot_balance, 0)) AS snapshot_total,
-		       SUM(COALESCE(owed.net_debits, 0)) AS net_debits_total
-		  FROM (
-		        SELECT accounts.normal_side,
-		               latest.closing_balance AS snapshot_balance,
-		               (SELECT SUM(CASE WHEN legs.side = 'debit' THEN legs.amount ELSE -legs.amount END)
-		                  FROM journal_legs legs
-		                 WHERE legs.ledger_account_id = accounts.id
-		                   AND legs.id > COALESCE(latest.last_journal_leg_id, 0)) AS net_debits
-		          FROM ledger_accounts accounts
-		          LEFT JOIN (SELECT ledger_account_id, MAX(snapshot_date) AS snapshot_date
-		                       FROM ledger_daily_snapshots
-		                      GROUP BY ledger_account_id) newest
-		                 ON newest.ledger_account_id = accounts.id
-		          LEFT JOIN ledger_daily_snapshots latest
-		                 ON latest.ledger_account_id = newest.ledger_account_id
-		                AND latest.snapshot_date = newest.snapshot_date
-		         WHERE accounts.asset_code = ?
-		           AND ((accounts.user_id IS NOT NULL AND accounts.code IN ?)
-		             OR (accounts.owner_key = ? AND accounts.code IN ?))
-		       ) owed
-		 GROUP BY owed.normal_side`,
-		assetCode,
-		[]string{CodeUserPrimary, CodeUserReferral, CodeUserCard},
-		ownerCompany, []string{CodeCashpointEscrow, CodePayoutInTransit, CodePurchaseInTransit},
-	).Scan(&groups).Error
+// FreeFundsOf adds up FreeFunds for one asset. Pass databaseTransaction
+// when calling inside a transaction, so the read sees the same data as the
+// posting. It gives exactly the numbers FreeFundsForAssets gives.
+func (service *Service) FreeFundsOf(query *gorm.DB, assetCode string) (FreeFunds, error) {
+	results, err := service.FreeFundsForAssets(query, []string{assetCode})
 	if err != nil {
-		return result, err
+		return FreeFunds{AssetCode: assetCode, Vaults: money.Zero(), Owed: money.Zero(), Free: money.Zero(), TribeFunds: money.Zero()}, err
 	}
-	for _, group := range groups {
-		snapshotTotal, err := money.ParseUnits(group.SnapshotTotal.String)
-		if err != nil {
-			return result, err
-		}
-		sinceSnapshots, err := money.ParseUnits(group.NetDebitsTotal.String)
-		if err != nil {
-			return result, err
-		}
-		if group.NormalSide == Credit {
-			sinceSnapshots = sinceSnapshots.Negate()
-		}
-		result.Owed = result.Owed.Add(snapshotTotal).Add(sinceSnapshots)
-	}
-	result.Free = result.Vault.Subtract(result.Owed)
-	return result, nil
+	return results[assetCode], nil
 }
 
 // FreeFundsForAssets adds up FreeFunds for many assets at once (the admin
-// free-funds page), keyed by asset code. It gives exactly the same numbers
-// as calling FreeFundsOf for each asset, with a fixed number of queries
+// Inventory page), keyed by asset code, with a fixed number of queries
 // however many currencies there are:
 //
-//  1. one query loads the company vault of every asset,
-//  2. one batched balance query (balancesOfAccounts) sums those vaults,
+//  1. one query loads every provider vault and Tribe Funds account of these assets,
+//  2. one batched balance query (balancesOfAccounts) sums them,
 //  3. one query sums what we owe customers, grouped by currency.
 //
-// Before, the page called FreeFundsOf once per asset: three queries per
-// currency, and each one re-read the latest snapshot date of every account
-// in the ledger. Now that read happens once for all currencies.
-// FreeFundsOf stays for single-asset callers (approving a manual credit).
-// Like FreeFundsOf, it is a display read here; pass databaseTransaction to
-// read inside a transaction.
+// It is a display read; pass databaseTransaction to read inside a transaction.
 func (service *Service) FreeFundsForAssets(query *gorm.DB, assetCodes []string) (map[string]FreeFunds, error) {
 	results := make(map[string]FreeFunds, len(assetCodes))
 	if len(assetCodes) == 0 {
 		return results, nil
 	}
 
-	// 1 and 2: the vaults and their balances.
-	var vaults []models.LedgerAccount
-	if err := query.Where("owner_key = ? AND code = ? AND asset_code IN ?", ownerCompany, CodeCompanyVault, assetCodes).
-		Find(&vaults).Error; err != nil {
+	// 1 and 2: the provider vaults and Tribe Funds, with their balances.
+	var companyAccounts []models.LedgerAccount
+	if err := query.Where("asset_code IN ? AND ((owner_key LIKE ? AND code = ?) OR (owner_key = ? AND code = ?))",
+		assetCodes, ProviderOwnerPrefix+"%", CodeProviderVault, ownerCompany, CodeTribeFunds).
+		Find(&companyAccounts).Error; err != nil {
 		return nil, err
 	}
-	vaultByAsset := make(map[string]models.LedgerAccount, len(vaults))
-	for _, vault := range vaults {
-		vaultByAsset[vault.AssetCode] = vault
-	}
-	for _, assetCode := range assetCodes {
-		if _, found := vaultByAsset[assetCode]; !found {
-			return nil, fmt.Errorf("company vault %s missing (run db:seed)", assetCode)
-		}
-	}
-	vaultBalances, err := service.balancesOfAccounts(query, vaults)
+	balances, err := service.balancesOfAccounts(query, companyAccounts)
 	if err != nil {
 		return nil, err
+	}
+	vaultsByAsset := map[string]money.Amount{}
+	fundsByAsset := map[string]money.Amount{}
+	for _, account := range companyAccounts {
+		balance, found := balances[account.ID]
+		if !found {
+			balance = money.Zero()
+		}
+		if account.Code == CodeTribeFunds {
+			fundsByAsset[account.AssetCode] = balance
+			continue
+		}
+		total, found := vaultsByAsset[account.AssetCode]
+		if !found {
+			total = money.Zero()
+		}
+		vaultsByAsset[account.AssetCode] = total.Add(balance)
 	}
 
 	// 3: what we owe customers, per currency, in ONE statement.
 	//
-	// The inner SELECT has one row per owed account (customer wallets,
-	// referral and card balances, plus Cashpoint Escrow, Payouts In
-	// Transit and Purchases In Transit) in the asked currencies, with:
+	// The inner SELECT has one row per customer account (owedUserCodes) in
+	// the asked currencies, with:
 	//   - snapshot_balance: the closing balance of its latest daily snapshot
 	//     (NULL when it has none yet),
 	//   - net_debits: debits minus credits of the legs posted AFTER that
 	//     snapshot (the (account, id) index on journal_legs).
-	// The (asset_code, code) index picks the owed accounts.
+	// The (asset_code, code) index picks the customer accounts.
 	//
 	// "newest" lists every account's latest snapshot date. It is NOT
-	// limited to the owed accounts on purpose: alone on one table, MySQL
+	// limited to the customer accounts on purpose: alone on one table, MySQL
 	// answers it with ONE jump per account through the UNIQUE (account,
 	// date) index (EXPLAIN: "Using index for group-by"). Every way of
-	// limiting it to the owed accounts (a join, IN (SELECT ...), or a
-	// correlated MAX per account) loses that shortcut on MySQL 5.7 and reads
-	// EVERY snapshot of every owed account instead. Measured on 10,000
-	// accounts x 200 days of snapshots: 0.23s unlimited vs 0.44s limited,
-	// and the gap grows every day. It now runs once for all currencies
-	// instead of once per currency, which is where the time went before.
-	// "latest" then fetches that one snapshot row by the same unique key.
+	// limiting it (a join, IN (SELECT ...), or a correlated MAX per account)
+	// loses that shortcut on MySQL 5.7 and reads EVERY snapshot of every
+	// account instead. "latest" then fetches that one snapshot row by the
+	// same unique key.
 	//
 	// The outer SELECT adds them up per (currency, normal side). The side
 	// matters because a snapshot's closing balance is already "positive =
@@ -422,13 +352,11 @@ func (service *Service) FreeFundsForAssets(query *gorm.DB, assetCodes []string) 
 		                 ON latest.ledger_account_id = newest.ledger_account_id
 		                AND latest.snapshot_date = newest.snapshot_date
 		         WHERE accounts.asset_code IN ?
-		           AND ((accounts.user_id IS NOT NULL AND accounts.code IN ?)
-		             OR (accounts.owner_key = ? AND accounts.code IN ?))
+		           AND accounts.user_id IS NOT NULL
+		           AND accounts.code IN ?
 		       ) owed
 		 GROUP BY owed.asset_code, owed.normal_side`,
-		assetCodes,
-		[]string{CodeUserPrimary, CodeUserReferral, CodeUserCard},
-		ownerCompany, []string{CodeCashpointEscrow, CodePayoutInTransit, CodePurchaseInTransit},
+		assetCodes, owedUserCodes,
 	).Scan(&groups).Error
 	if err != nil {
 		return nil, err
@@ -453,16 +381,18 @@ func (service *Service) FreeFundsForAssets(query *gorm.DB, assetCodes []string) 
 		owedByAsset[group.AssetCode] = owed.Add(snapshotTotal).Add(sinceSnapshots)
 	}
 
+	orZero := func(amounts map[string]money.Amount, assetCode string) money.Amount {
+		if amount, found := amounts[assetCode]; found {
+			return amount
+		}
+		return money.Zero()
+	}
 	for _, assetCode := range assetCodes {
-		vaultBalance, found := vaultBalances[vaultByAsset[assetCode].ID]
-		if !found {
-			vaultBalance = money.Zero()
+		vaults, owed := orZero(vaultsByAsset, assetCode), orZero(owedByAsset, assetCode)
+		results[assetCode] = FreeFunds{
+			AssetCode: assetCode, Vaults: vaults, Owed: owed, Free: vaults.Subtract(owed),
+			TribeFunds: orZero(fundsByAsset, assetCode),
 		}
-		owed, found := owedByAsset[assetCode]
-		if !found {
-			owed = money.Zero()
-		}
-		results[assetCode] = FreeFunds{AssetCode: assetCode, Vault: vaultBalance, Owed: owed, Free: vaultBalance.Subtract(owed)}
 	}
 	return results, nil
 }

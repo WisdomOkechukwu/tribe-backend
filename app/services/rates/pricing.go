@@ -27,6 +27,7 @@ type Price struct {
 	UsesNgnRail     bool
 	NairaIn         *money.Amount // NGN rail: Naira we get for the from-asset (market value)
 	NairaOut        *money.Amount // NGN rail: Naira we pay for the to-asset (market value)
+	MarketReceived  *money.Amount // other routes: what Received would be at the market rate, before our margin
 	Route           []RouteLeg
 	UsdValue        *big.Rat             // USD value of the converted amount, for reports
 	RatesUsed       map[string][2]string // asset -> [usd, ngn] used, saved on the journal legs
@@ -217,6 +218,14 @@ func (service *Service) PriceConversion(requestContext context.Context, input Pr
 		}
 	}
 	price.Route = buildRoute(market, price, fromProvider, toProvider)
+	if !price.UsesNgnRail {
+		// Off the rail our margin is earned in the to-asset: the market value
+		// of what is converted, minus what the user receives. It is posted to
+		// the Earnings Vault (ledger.ConversionLegs).
+		marketRate := new(big.Rat).Quo(market.usd[from.Code], market.usd[to.Code])
+		marketValue := money.FromRational(new(big.Rat).Mul(price.Converted.ToRational(from.DecimalPlaces), marketRate), to.DecimalPlaces, money.RoundHalfUp)
+		price.MarketReceived = &marketValue
+	}
 	return price, nil
 }
 

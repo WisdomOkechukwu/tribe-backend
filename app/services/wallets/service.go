@@ -116,8 +116,8 @@ func (service *Service) ReceiveDetails(requestContext context.Context, userID st
 	}, nil
 }
 
-// TestTopUp adds money to a wallet through the REAL ledger (Dr Company Vault,
-// Cr User Wallet). It only works outside production. There is no route for it
+// TestTopUp adds money to a wallet through the REAL ledger (Dr the currency's
+// home provider vault, Cr User Wallet). It only works outside production. There is no route for it
 // any more (admins credit customers with RequestCustomerAdjustment instead);
 // the seeders and integration tests call it to give demo users money.
 func (service *Service) TestTopUp(requestContext context.Context, actor shared.Actor, assetCode string, amountText string, reference string) (*models.Transaction, error) {
@@ -148,7 +148,7 @@ func (service *Service) TestTopUp(requestContext context.Context, actor shared.A
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
-		vault, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCompanyVault, asset.Code)
+		vault, err := service.ledger.HomeVault(databaseTransaction, asset.Code)
 		if err != nil {
 			return err
 		}
@@ -172,22 +172,30 @@ func (service *Service) TestTopUp(requestContext context.Context, actor shared.A
 	return transaction, nil
 }
 
-// RequestTreasuryFunding records that the company put its own money into a
-// vault (the admin "Top up inventory" button). Nothing is posted yet: the
+// RequestTreasuryFunding records that the owners put Tribe's own money into a
+// provider's vault (the admin "Record treasury funding" form). providerID
+// picks the provider; empty means the currency's home provider. Nothing is posted yet: the
 // request waits as "pending" until a DIFFERENT admin approves it
 // (see ApproveTreasuryFunding). This "four eyes" rule stops one person from
 // creating money on their own.
-func (service *Service) RequestTreasuryFunding(requestContext context.Context, adminID string, adminName string, assetCode string, amountText string, externalReference string, note string) (*models.TreasuryFunding, error) {
+func (service *Service) RequestTreasuryFunding(requestContext context.Context, adminID string, adminName string, assetCode string, providerID string, amountText string, externalReference string, note string) (*models.TreasuryFunding, error) {
 	asset, err := shared.LoadAsset(service.database.WithContext(requestContext), assetCode)
 	if err != nil {
 		return nil, err
+	}
+	if providerID == "" && asset.ConversionProviderID != nil {
+		providerID = *asset.ConversionProviderID
+	}
+	// The provider must really hold this currency for us (it has a vault for it).
+	if _, err := service.ledger.ProviderVault(service.database.WithContext(requestContext), providerID, asset.Code); err != nil {
+		return nil, apperrors.Validation(map[string][]string{"provider_id": {"That provider does not hold " + asset.Code + "."}})
 	}
 	amount, err := money.ParseDecimal(amountText, asset.DecimalPlaces)
 	if err != nil || !amount.IsPositive() {
 		return nil, apperrors.Validation(map[string][]string{"amount": {"Enter a valid amount."}})
 	}
 	funding := &models.TreasuryFunding{
-		ID: ids.New(), AssetCode: asset.Code, Amount: amount.UnitsString(), Status: models.FundingPending,
+		ID: ids.New(), AssetCode: asset.Code, ProviderID: &providerID, Amount: amount.UnitsString(), Status: models.FundingPending,
 		ExternalReference: externalReference, Note: note, RequestedBy: adminID, RequestedByName: adminName,
 		CreatedAt: time.Now().UTC(),
 	}
@@ -204,7 +212,7 @@ func (service *Service) RequestTreasuryFunding(requestContext context.Context, a
 // arrived". In ONE database transaction it locks the request, checks it is
 // still pending and was raised by someone else, then posts:
 //
-//	Dr Company Vault / Cr Treasury Funding (equity)
+//	Dr the provider's vault / Cr Tribe Funds (source: treasury)
 func (service *Service) ApproveTreasuryFunding(requestContext context.Context, adminID string, adminName string, fundingID string) (*models.TreasuryFunding, error) {
 	var funding models.TreasuryFunding
 	err := database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
@@ -215,11 +223,16 @@ func (service *Service) ApproveTreasuryFunding(requestContext context.Context, a
 		if err != nil {
 			return err
 		}
-		vault, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCompanyVault, funding.AssetCode)
+		var vault *models.LedgerAccount
+		if funding.ProviderID != nil {
+			vault, err = service.ledger.ProviderVault(databaseTransaction, *funding.ProviderID, funding.AssetCode)
+		} else {
+			vault, err = service.ledger.HomeVault(databaseTransaction, funding.AssetCode)
+		}
 		if err != nil {
 			return err
 		}
-		equity, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeTreasuryFunding, funding.AssetCode)
+		equity, err := service.ledger.TribeFunds(databaseTransaction, funding.AssetCode)
 		if err != nil {
 			return err
 		}

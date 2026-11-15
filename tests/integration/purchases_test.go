@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tribe-africa/tribe-backend/app/models"
+	"github.com/tribe-africa/tribe-backend/pkg/money"
 	"github.com/tribe-africa/tribe-backend/tests/testenv"
 )
 
@@ -30,12 +31,13 @@ func purchaseEntries(test *testing.T, environment *testenv.Environment, transact
 
 // TestBillIsPaidOutsideTheTransactionAndSettled pays a bill with a provider
 // that answers straight away: the customer still gets the token in the same
-// response, the money went POST -> SETTLE through Purchases In Transit, and
-// nothing is left in transit.
+// response, and the ₦5,000 left the bills provider's vault in the one
+// :POST entry (confirming it posts nothing more).
 func TestBillIsPaidOutsideTheTransactionAndSettled(test *testing.T) {
 	environment := testenv.Start(test)
 	user := environment.RegisterUser(test, "billpayer")
 	user.TopUp(test, "NGN", "20000")
+	billsVaultBefore := providerVaultBalance(test, environment, "utilities-simulator", "NGN")
 
 	response := payBill(test, user, "45678901")
 	if !response.Success {
@@ -50,15 +52,17 @@ func TestBillIsPaidOutsideTheTransactionAndSettled(test *testing.T) {
 	if transaction.Status != "completed" || transaction.Meta["token"] == nil {
 		test.Fatalf("bill = %+v, want completed with a token", transaction)
 	}
-	if purchaseEntries(test, environment, transaction.ID, ":POST") != 1 || purchaseEntries(test, environment, transaction.ID, ":SETTLE") != 1 {
-		test.Errorf("want exactly one POST and one SETTLE entry")
+	if purchaseEntries(test, environment, transaction.ID, ":POST") != 1 || purchaseEntries(test, environment, transaction.ID, ":SETTLE") != 0 {
+		test.Errorf("want exactly one POST entry and no SETTLE entry")
+	}
+	if paid := billsVaultBefore.Subtract(providerVaultBalance(test, environment, "utilities-simulator", "NGN")); paid.Decimal(2) != "5000.00" {
+		test.Errorf("the bills provider's vault went down by %s, want 5000.00", paid.Decimal(2))
 	}
 	var tokens int64
 	environment.App.Database.Model(&models.VaultToken{}).Where("meter = ?", "45678901").Count(&tokens)
 	if tokens != 1 {
 		test.Errorf("%d vault tokens saved, want 1", tokens)
 	}
-	assertNothingInTransit(test, environment, "NGN")
 	assertBooksBalance(test, environment)
 }
 
@@ -69,6 +73,7 @@ func TestRefusedBillIsRefundedExactly(test *testing.T) {
 	environment := testenv.Start(test)
 	user := environment.RegisterUser(test, "billrefused")
 	user.TopUp(test, "NGN", "20000")
+	billsVaultBefore := providerVaultBalance(test, environment, "utilities-simulator", "NGN")
 
 	response := payBill(test, user, "45670000") // the simulator refuses targets ending in 0000
 	if response.Success || response.Code != "PROVIDER_REFUSED" {
@@ -85,14 +90,16 @@ func TestRefusedBillIsRefundedExactly(test *testing.T) {
 	if purchaseEntries(test, environment, transaction.ID, ":POST:REVERSAL") != 1 || purchaseEntries(test, environment, transaction.ID, ":SETTLE") != 0 {
 		test.Errorf("want one reversal and no settlement")
 	}
-	assertNothingInTransit(test, environment, "NGN")
+	if after := providerVaultBalance(test, environment, "utilities-simulator", "NGN"); after.Compare(billsVaultBefore) != 0 {
+		test.Errorf("the bills provider's vault is %s after a refused bill, want it back at %s", after.Decimal(2), billsVaultBefore.Decimal(2))
+	}
 	assertBooksBalance(test, environment)
 }
 
 // TestSlowBillStaysPendingThenSettlesExactlyOnce makes the biller time out
 // on the first try. The customer is charged once and the bill stays
 // pending (a timeout is never treated as a refusal). Then ten workers
-// finish it AT THE SAME TIME: exactly one settlement may be posted.
+// finish it AT THE SAME TIME: it must be completed exactly once.
 func TestSlowBillStaysPendingThenSettlesExactlyOnce(test *testing.T) {
 	environment := testenv.Start(test)
 	user := environment.RegisterUser(test, "billslow")
@@ -129,13 +136,19 @@ func TestSlowBillStaysPendingThenSettlesExactlyOnce(test *testing.T) {
 	if finished.Status != models.TransactionStatusCompleted {
 		test.Errorf("status = %s, want completed", finished.Status)
 	}
-	if settled := purchaseEntries(test, environment, transaction.ID, ":SETTLE"); settled != 1 {
-		test.Errorf("%d settlement entries, want exactly 1", settled)
+	// Settling posts nothing; "completed exactly once" shows as one "paid" message.
+	var paidMessages int64
+	environment.App.Database.Model(&models.InboxMessage{}).
+		Where("user_id = ? AND title LIKE ?", finished.UserID, "% paid").Count(&paidMessages)
+	if paidMessages != 1 {
+		test.Errorf("%d \"paid\" messages, want exactly 1 (the bill was settled more than once)", paidMessages)
+	}
+	if posts := purchaseEntries(test, environment, transaction.ID, ":POST"); posts != 1 {
+		test.Errorf("%d POST entries, want exactly 1", posts)
 	}
 	if balance := user.Balance(test, "NGN"); balance != afterCharge {
 		test.Errorf("balance moved from %s to %s while settling; the customer must be charged once", afterCharge, balance)
 	}
-	assertNothingInTransit(test, environment, "NGN")
 	assertBooksBalance(test, environment)
 }
 
@@ -146,6 +159,7 @@ func TestGiftCardCodeIsReturnedAndCanBeRevealedAgain(test *testing.T) {
 	environment := testenv.Start(test)
 	user := environment.RegisterUser(test, "giftbuyer")
 	user.TopUp(test, "USD", "100")
+	giftVaultBefore := providerVaultBalance(test, environment, "giftcards-simulator", "USD")
 
 	response := user.Call(test, http.MethodPost, "/api/mobile/v1/gift-cards/buy", map[string]any{
 		"brand_id": "steam", "face_usd": "25", "asset": "USD", "pin": testenv.DemoPin,
@@ -177,7 +191,9 @@ func TestGiftCardCodeIsReturnedAndCanBeRevealedAgain(test *testing.T) {
 	if revealed.Code != bought.Code {
 		test.Errorf("revealed %q, bought %q", revealed.Code, bought.Code)
 	}
-	assertNothingInTransit(test, environment, "USD")
+	if paid := giftVaultBefore.Subtract(providerVaultBalance(test, environment, "giftcards-simulator", "USD")); paid.Decimal(2) != "25.00" {
+		test.Errorf("the gift card provider's vault went down by %s, want 25.00", paid.Decimal(2))
+	}
 	assertBooksBalance(test, environment)
 }
 
@@ -204,19 +220,20 @@ func TestSweeperRequeuesStuckPurchases(test *testing.T) {
 	}
 }
 
-// assertNothingInTransit checks Purchases In Transit is back to zero: every
-// purchase was either settled or refunded.
-func assertNothingInTransit(test *testing.T, environment *testenv.Environment, assetCode string) {
+// providerVaultBalance is what one provider (by slug) holds for Tribe in a currency.
+func providerVaultBalance(test *testing.T, environment *testenv.Environment, providerSlug string, assetCode string) money.Amount {
 	test.Helper()
-	account, err := environment.App.Ledger.CompanyAccount(environment.App.Database, "purchase_in_transit", assetCode)
-	if err != nil {
-		test.Fatalf("purchase in transit %s: %v", assetCode, err)
+	var provider models.Provider
+	if err := environment.App.Database.Where("slug = ?", providerSlug).Take(&provider).Error; err != nil {
+		test.Fatalf("provider %s: %v", providerSlug, err)
 	}
-	balance, err := environment.App.Ledger.BalanceOf(context.Background(), account.ID)
+	vault, err := environment.App.Ledger.ProviderVault(environment.App.Database, provider.ID, assetCode)
+	if err != nil {
+		test.Fatalf("vault %s %s: %v", providerSlug, assetCode, err)
+	}
+	balance, err := environment.App.Ledger.BalanceOf(context.Background(), vault.ID)
 	if err != nil {
 		test.Fatalf("balance: %v", err)
 	}
-	if !balance.IsZero() {
-		test.Errorf("Purchases In Transit %s holds %s, want 0", assetCode, balance.UnitsString())
-	}
+	return balance
 }

@@ -175,15 +175,48 @@ type Cashpoint struct {
 }
 
 // ReferralEarning is money earned from an invited friend (table: referral_earnings).
+//
+// It is the inviter's share of what Tribe earned on ONE transaction of the
+// invited friend. Status follows the money: "accrued" while the share waits
+// in the Referral Vault (the friend's transaction is still with a provider),
+// "paid" once it is in the inviter's referral balance, "cancelled" when the
+// friend's transaction was refused and reversed.
 type ReferralEarning struct {
-	ID           string    `gorm:"primaryKey" json:"id"`
-	UserID       string    `json:"user_id"`
-	FriendUserID *string   `json:"friend_user_id"`
-	FriendName   string    `json:"friend_name"`
-	Description  string    `json:"description"`
-	AmountNgn    string    `json:"amount_ngn"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID             string     `gorm:"primaryKey" json:"id"`
+	UserID         string     `json:"user_id"` // the inviter, who receives it
+	FriendUserID   *string    `json:"friend_user_id"`
+	TransactionID  *string    `json:"transaction_id"` // the friend's transaction that earned it
+	FriendName     string     `json:"friend_name"`
+	Description    string     `json:"description"`
+	AmountNgn      string     `json:"amount_ngn"`
+	Status         string     `json:"status"`        // ReferralAccrued | ReferralPaid | ReferralCancelled
+	SharePercent   *string    `json:"share_percent"` // the referral share in force when it was earned
+	AccrualEntryID *string    `json:"accrual_entry_id"`
+	PayoutEntryID  *string    `json:"payout_entry_id"`
+	PaidAt         *time.Time `json:"paid_at"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
+
+// Referral earning statuses.
+const (
+	ReferralAccrued   = "accrued"
+	ReferralPaid      = "paid"
+	ReferralCancelled = "cancelled"
+)
+
+// ReferralSettings is the referral share an admin sets (table:
+// referral_settings, one row with id 1): the percentage of what Tribe earns
+// on an invited customer's transaction that goes to the person who invited them.
+type ReferralSettings struct {
+	ID           uint8     `gorm:"primaryKey" json:"-"`
+	SharePercent string    `json:"share_percent"`
+	Version      int       `json:"version"`
+	UpdatedBy    string    `json:"updated_by"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// TableName tells GORM the table name.
+func (ReferralSettings) TableName() string { return "referral_settings" }
 
 // InboxMessage is a notification in the app inbox (table: inbox_messages).
 type InboxMessage struct {

@@ -27,9 +27,8 @@ import (
 //     it, and where its live price comes from);
 //  2. a `rate_margins` row (the buy/sell margin, starting at zero);
 //  3. a `provider_assets` row (which provider handles it);
-//  4. the company's ledger accounts for it (its vault, fee revenue and the
-//     rest of ledger.CompanyAccountTemplates). Without these no money in
-//     that currency could ever be posted.
+//  4. its ledger accounts: Tribe Funds and the provider's vault for it.
+//     Without these no money in that currency could ever be posted.
 //
 // A new currency starts SWITCHED OFF. Nothing can use it until an admin
 // switches it on (UpdateCurrency), which first makes sure the accounts exist
@@ -166,12 +165,27 @@ func (service *Service) CreateCurrency(requestContext context.Context, admin *ad
 	return &asset, nil
 }
 
-// ensureCompanyAccounts makes the company's ledger accounts for a currency
-// (one per entry of ledger.CompanyAccountTemplates). Each one is created
-// only if it is missing, so it is safe to run again.
+// ensureCompanyAccounts makes the ledger accounts for a currency: its Tribe
+// Funds (ledger.CompanyAccountTemplates) and a vault at every provider that
+// handles it (provider_assets). Each one is created only if it is missing,
+// so it is safe to run again.
 func (service *Service) ensureCompanyAccounts(requestContext context.Context, assetCode string) error {
 	for _, template := range ledger.CompanyAccountTemplates {
 		if _, err := service.ledger.EnsureCompanyAccount(requestContext, template, assetCode); err != nil {
+			return err
+		}
+	}
+	query := service.database.WithContext(requestContext)
+	var providerAssets []models.ProviderAsset
+	if err := query.Where("asset_code = ?", assetCode).Find(&providerAssets).Error; err != nil {
+		return err
+	}
+	for _, providerAsset := range providerAssets {
+		var provider models.Provider
+		if err := query.Where("id = ?", providerAsset.ProviderID).Take(&provider).Error; err != nil {
+			return err
+		}
+		if _, err := service.ledger.EnsureProviderVault(requestContext, provider, assetCode); err != nil {
 			return err
 		}
 	}

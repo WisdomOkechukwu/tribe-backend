@@ -470,6 +470,33 @@ func (controller *Controller) UpdateTransactionFee(httpContext *gin.Context) {
 	responses.OK(httpContext, "Fee saved.", fee)
 }
 
+// ReferralSettings  GET /admin-api/referral-settings  -> the share of earnings paid to inviters.
+func (controller *Controller) ReferralSettings(httpContext *gin.Context) {
+	settings, err := controller.application.Referrals.Settings(httpContext.Request.Context())
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	responses.OK(httpContext, "Referral settings loaded.", settings)
+}
+
+// UpdateReferralSettings  PUT /admin-api/referral-settings
+func (controller *Controller) UpdateReferralSettings(httpContext *gin.Context) {
+	var input requests.ReferralSettingsRequest
+	if err := requests.Bind(httpContext, &input); err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	admin := middleware.CurrentAdmin(httpContext)
+	before, after, err := controller.application.Referrals.SaveSettings(httpContext.Request.Context(), admin.Name, input.SharePercent, input.Version)
+	if err != nil {
+		responses.Error(httpContext, err)
+		return
+	}
+	controller.application.AdminAuth.Audit(httpContext.Request.Context(), admin, "referrals.share", "referral_settings", "Changed the referral share to "+after.SharePercent+"%", before, after)
+	responses.OK(httpContext, "Referral share saved.", after)
+}
+
 // Inventory  GET /admin-api/inventory  -> company vaults with balances.
 func (controller *Controller) Inventory(httpContext *gin.Context) {
 	inventory, err := controller.application.Backoffice.Inventory(httpContext.Request.Context())
@@ -508,7 +535,7 @@ func (controller *Controller) CreateTreasuryFunding(httpContext *gin.Context) {
 		return
 	}
 	admin := middleware.CurrentAdmin(httpContext)
-	funding, err := controller.application.Wallets.RequestTreasuryFunding(httpContext.Request.Context(), admin.ID, admin.Name, input.Asset, input.Amount, input.ExternalReference, input.Note)
+	funding, err := controller.application.Wallets.RequestTreasuryFunding(httpContext.Request.Context(), admin.ID, admin.Name, input.Asset, input.ProviderID, input.Amount, input.ExternalReference, input.Note)
 	if err != nil {
 		responses.Error(httpContext, err)
 		return

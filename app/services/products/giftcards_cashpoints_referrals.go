@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -40,10 +41,10 @@ type GiftCardInput struct {
 }
 
 // BuyGiftCard buys a card with any asset, in the same two steps as PayBill:
-// the money is converted into Purchases In Transit USD and the transaction
-// saved as pending in one commit; the provider is then asked OUTSIDE any
-// transaction (see ProcessPurchase). On confirmation the card cost leaves
-// the Company Vault USD; on a refusal the posting is reversed.
+// the money is converted and paid out of the gift card provider's dollar
+// vault, and the transaction saved as pending, in one commit; the provider
+// is then asked OUTSIDE any transaction (see ProcessPurchase). On a refusal
+// the posting is reversed.
 //
 // The code is returned when the provider answered straight away; otherwise
 // it is empty and the customer reveals it later (RevealGiftCardCode).
@@ -67,7 +68,10 @@ func (service *Service) BuyGiftCard(requestContext context.Context, actor shared
 	if _, err := service.providers.GiftCards(); err != nil {
 		return nil, "", err
 	}
-	if _, err := service.ledger.EnsureCompanyAccount(requestContext, ledger.PurchaseInTransitTemplate(), "USD"); err != nil {
+	// The provider may still refuse, so an inviter's share is only recorded
+	// now and paid when the card is confirmed (settlePurchase).
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, false)
+	if err != nil {
 		return nil, "", err
 	}
 
@@ -76,19 +80,19 @@ func (service *Service) BuyGiftCard(requestContext context.Context, actor shared
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
-		inTransit, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodePurchaseInTransit, "USD")
+		giftVault, err := service.productVault(databaseTransaction, brand.ProviderID, models.ProviderCategoryGiftCard, "USD")
 		if err != nil {
 			return err
 		}
 		posting := ledger.ConversionPosting{
 			Reference: input.Reference + ":POST", TransactionType: "gift_buy", Description: brand.Name + " gift card",
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-			SourceAccountID: sourceWallet.ID, TargetAccountID: inTransit.ID,
+			SourceAccountID: sourceWallet.ID, TargetAccountID: giftVault.ID,
 			FromAsset: input.Asset, ToAsset: "USD", Converted: converted, Fee: fee, Received: faceValue,
-			Rates: service.rates.RatesFor(databaseTransaction, input.Asset, "USD", "NGN"),
+			Rates: service.rates.RatesFor(databaseTransaction, input.Asset, "USD", "NGN"), ReferralShare: invitation.ShareOf(),
 		}
 		if price != nil {
-			posting.NairaIn, posting.NairaOut = price.NairaIn, price.NairaOut
+			posting.NairaIn, posting.NairaOut, posting.MarketReceived = price.NairaIn, price.NairaOut, price.MarketReceived
 		}
 		postResult, err := service.ledger.PostConversion(databaseTransaction, posting)
 		if err != nil {
@@ -104,6 +108,9 @@ func (service *Service) BuyGiftCard(requestContext context.Context, actor shared
 			Metadata: shared.JSON(map[string]any{"gift_brand": brand.ID, "face": faceValue.Decimal(2)}),
 		}
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, postResult); err != nil {
 			return err
 		}
 		if price != nil {
@@ -182,18 +189,28 @@ func (service *Service) SellGiftCard(requestContext context.Context, actor share
 	if err != nil {
 		return nil, err
 	}
+	// A sold card is paid out at once, so an inviter's share is paid at once.
+	invitation, err := service.referrals.Prepare(requestContext, actor.UserID, true)
+	if err != nil {
+		return nil, err
+	}
+	var marketReceived *money.Amount
+	if price != nil {
+		marketReceived = price.MarketReceived // the margin of the Naira -> payout asset step
+	}
 
 	transaction := &models.Transaction{ID: ids.New(), Reference: input.Reference, UserID: actor.UserID}
 	err = database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
-		usdVault, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCompanyVault, "USD")
+		giftVault, err := service.productVault(databaseTransaction, brand.ProviderID, models.ProviderCategoryGiftCard, "USD")
 		if err != nil {
 			return err
 		}
-		// We receive the card's dollar value (Dr Vault USD) and pay the user
-		// Naira. The Naira legs record the market value vs what we paid.
+		// The gift card provider credits us the card's dollar value (Dr its
+		// vault USD), the dollars are sold for Naira at the home provider, and
+		// the user is paid. The Naira legs record the market value vs what we paid.
 		usdRate := service.rates.RatesFor(databaseTransaction, "USD")["USD"][1]
 		marketNaira := nairaPayout
 		if rate, err := money.ParseRate(usdRate); err == nil {
@@ -202,10 +219,10 @@ func (service *Service) SellGiftCard(requestContext context.Context, actor share
 		postResult, err := service.ledger.PostConversion(databaseTransaction, ledger.ConversionPosting{
 			Reference: input.Reference + ":POST", TransactionType: "gift_sell", Description: "Sold " + brand.Name + " gift card",
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-			SourceAccountID: usdVault.ID, TargetAccountID: userWallet.ID,
+			SourceAccountID: giftVault.ID, TargetAccountID: userWallet.ID,
 			FromAsset: "USD", ToAsset: payoutAsset, Converted: faceValue, Fee: money.Zero(), Received: received,
-			NairaIn: &marketNaira, NairaOut: &nairaPayout,
-			Rates: service.rates.RatesFor(databaseTransaction, "USD", payoutAsset, "NGN"),
+			NairaIn: &marketNaira, NairaOut: &nairaPayout, MarketReceived: marketReceived,
+			Rates: service.rates.RatesFor(databaseTransaction, "USD", payoutAsset, "NGN"), ReferralShare: invitation.ShareOf(),
 		})
 		if err != nil {
 			return err
@@ -220,6 +237,9 @@ func (service *Service) SellGiftCard(requestContext context.Context, actor share
 			Metadata: shared.JSON(map[string]any{"gift_brand": brand.ID, "face": faceValue.Decimal(2)}),
 		}
 		if err := shared.RecordTransaction(databaseTransaction, transaction); err != nil {
+			return err
+		}
+		if err := service.referrals.Record(databaseTransaction, invitation, transaction, postResult); err != nil {
 			return err
 		}
 		if err := shared.NotifyTransaction(databaseTransaction, transaction, "money", "Gift card sold"); err != nil {
@@ -255,7 +275,9 @@ func (service *Service) loadBrandAndFace(requestContext context.Context, input G
 
 var twelveDigits = regexp.MustCompile(`^[0-9]{12}$`)
 
-// CreateCashpoint takes Naira from the user's wallet into escrow and returns a 12-digit code.
+// CreateCashpoint moves Naira from the user's wallet into their cashpoint
+// balance (still money we owe them, set aside for the code) and returns a
+// 12-digit code. The money stays at the provider the whole time.
 func (service *Service) CreateCashpoint(requestContext context.Context, actor shared.Actor, amountNgn string, pin string, reference string) (*models.Cashpoint, string, error) {
 	if err := service.auth.VerifyPin(requestContext, actor.UserID, pin); err != nil {
 		return nil, "", err
@@ -265,6 +287,10 @@ func (service *Service) CreateCashpoint(requestContext context.Context, actor sh
 		return nil, "", apperrors.Validation(map[string][]string{"amount_ngn": {"Enter a valid amount."}})
 	}
 	userWallet, err := service.ledger.EnsureUserAccount(requestContext, actor.UserID, ledger.CodeUserPrimary, "NGN")
+	if err != nil {
+		return nil, "", err
+	}
+	cashpointHold, err := service.ledger.EnsureUserAccount(requestContext, actor.UserID, ledger.CodeUserCashpoint, "NGN")
 	if err != nil {
 		return nil, "", err
 	}
@@ -283,14 +309,10 @@ func (service *Service) CreateCashpoint(requestContext context.Context, actor sh
 		if _, err := shared.LockActor(databaseTransaction, actor); err != nil {
 			return err
 		}
-		escrow, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCashpointEscrow, "NGN")
-		if err != nil {
-			return err
-		}
 		postResult, err := service.ledger.Post(databaseTransaction, ledger.Entry{
 			Reference: reference + ":POST", TransactionType: "cashpoint_create", Description: "Cashpoint created",
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-			Legs: ledger.MoveLegs(userWallet.ID, escrow.ID, amount, "Cashpoint escrow"),
+			Legs: ledger.MoveLegs(userWallet.ID, cashpointHold.ID, amount, "Cashpoint code"),
 		})
 		if err != nil {
 			return err
@@ -343,14 +365,14 @@ func (service *Service) RedeemCashpoint(requestContext context.Context, actor sh
 			return apperrors.New(http.StatusUnprocessableEntity, "OWN_CODE", "You can't redeem your own code. Cancel it instead.")
 		}
 		amount, _ := money.ParseUnits(cashpoint.Amount)
-		escrow, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCashpointEscrow, "NGN")
+		creatorHold, err := service.ledger.UserAccount(databaseTransaction, cashpoint.CreatorUserID, ledger.CodeUserCashpoint, "NGN")
 		if err != nil {
-			return err
+			return err // opened by CreateCashpoint, so it exists
 		}
 		postResult, err := service.ledger.Post(databaseTransaction, ledger.Entry{
 			Reference: "CASHPOINT-" + cashpoint.ID + ":REDEEM", TransactionType: "cashpoint_redeem", Description: "Cashpoint redeemed",
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &transaction.ID,
-			Legs: ledger.MoveLegs(escrow.ID, userWallet.ID, amount, "Cashpoint redeemed"),
+			Legs: ledger.MoveLegs(creatorHold.ID, userWallet.ID, amount, "Cashpoint redeemed"),
 		})
 		if err != nil {
 			return err
@@ -404,14 +426,14 @@ func (service *Service) CancelCashpoint(requestContext context.Context, actor sh
 			return apperrors.New(http.StatusUnprocessableEntity, "CODE_USED", "This code was already used or cancelled.")
 		}
 		amount, _ := money.ParseUnits(cashpoint.Amount)
-		escrow, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeCashpointEscrow, "NGN")
+		cashpointHold, err := service.ledger.UserAccount(databaseTransaction, actor.UserID, ledger.CodeUserCashpoint, "NGN")
 		if err != nil {
-			return err
+			return err // opened by CreateCashpoint, so it exists
 		}
 		if _, err := service.ledger.Post(databaseTransaction, ledger.Entry{
 			Reference: "CASHPOINT-" + cashpoint.ID + ":CANCEL", TransactionType: "cashpoint_cancel", Description: "Cashpoint cancelled",
 			CreatedBy: "user:" + actor.UserID, BusinessTransactionID: &cashpoint.TransactionID,
-			Legs: ledger.MoveLegs(escrow.ID, userWallet.ID, amount, "Cashpoint cancelled"),
+			Legs: ledger.MoveLegs(cashpointHold.ID, userWallet.ID, amount, "Cashpoint cancelled"),
 		}); err != nil {
 			return err
 		}
@@ -447,11 +469,12 @@ func (service *Service) ListCashpoints(requestContext context.Context, userID st
 
 // ReferralSummary is the referral screen.
 type ReferralSummary struct {
-	Code        string           `json:"code"`
-	Balance     string           `json:"balance"`
-	Earnings    []map[string]any `json:"earnings"`
-	Withdrawals []map[string]any `json:"withdrawals"`
-	Invited     int64            `json:"invited"`
+	Code         string           `json:"code"`
+	Balance      string           `json:"balance"`
+	SharePercent string           `json:"share_percent"` // the share of Tribe's earnings an inviter gets, e.g. "2"
+	Earnings     []map[string]any `json:"earnings"`
+	Withdrawals  []map[string]any `json:"withdrawals"`
+	Invited      int64            `json:"invited"`
 }
 
 // Referrals returns the referral balance and history.
@@ -469,11 +492,25 @@ func (service *Service) Referrals(requestContext context.Context, userID string)
 	if err != nil {
 		return nil, err
 	}
-	summary := &ReferralSummary{Code: user.ReferralCode, Balance: balance.Decimal(2), Earnings: []map[string]any{}, Withdrawals: []map[string]any{}}
+	settings, err := service.referrals.Settings(requestContext)
+	if err != nil {
+		return nil, err
+	}
+	sharePercent, err := money.ParseRate(settings.SharePercent)
+	if err != nil {
+		return nil, err
+	}
+	summary := &ReferralSummary{
+		Code: user.ReferralCode, Balance: balance.Decimal(2), SharePercent: trimmedPercent(sharePercent),
+		Earnings: []map[string]any{}, Withdrawals: []map[string]any{},
+	}
 	query.Model(&models.User{}).Where("referred_by_user_id = ?", userID).Count(&summary.Invited)
 
+	// Only earnings already in the referral balance. A share still waiting
+	// for a provider to confirm the friend's transaction (accrued) is not
+	// the inviter's money yet, and a cancelled one never will be.
 	var earnings []models.ReferralEarning
-	query.Where("user_id = ?", userID).Order("created_at DESC").Limit(100).Find(&earnings)
+	query.Where("user_id = ? AND status = ?", userID, models.ReferralPaid).Order("created_at DESC").Limit(100).Find(&earnings)
 	for _, earning := range earnings {
 		amount, _ := money.ParseUnits(earning.AmountNgn)
 		summary.Earnings = append(summary.Earnings, map[string]any{"id": earning.ID, "friend": earning.FriendName, "what": earning.Description, "amount": amount.Decimal(2), "date": earning.CreatedAt})
@@ -485,6 +522,13 @@ func (service *Service) Referrals(requestContext context.Context, userID string)
 		summary.Withdrawals = append(summary.Withdrawals, map[string]any{"id": withdrawal.ID, "amount_ngn": amount.Decimal(2), "to": "NGN", "tx_id": withdrawal.ID, "date": withdrawal.CreatedAt})
 	}
 	return summary, nil
+}
+
+// trimmedPercent writes a percentage without trailing zeros ("2", "2.5").
+func trimmedPercent(percent *big.Rat) string {
+	text := percent.FloatString(6)
+	text = strings.TrimRight(text, "0")
+	return strings.TrimSuffix(text, ".")
 }
 
 // WithdrawReferral moves referral earnings into the NGN wallet.
@@ -532,33 +576,4 @@ func (service *Service) WithdrawReferral(requestContext context.Context, actor s
 		return nil, err
 	}
 	return transaction, nil
-}
-
-// AwardReferral pays a referral bonus (Dr Referral Expense / Cr User Referral).
-// Used by the seeder for demo data; a real trigger would be "friend's first deposit".
-func (service *Service) AwardReferral(requestContext context.Context, userID string, friendName string, description string, amountNgn string) error {
-	amount, err := money.ParseDecimal(amountNgn, 2)
-	if err != nil {
-		return err
-	}
-	referralAccount, err := service.ledger.EnsureUserAccount(requestContext, userID, ledger.CodeUserReferral, "NGN")
-	if err != nil {
-		return err
-	}
-	earningID := ids.New()
-	return database.WithTransaction(requestContext, service.database, func(databaseTransaction *gorm.DB) error {
-		expense, err := service.ledger.CompanyAccount(databaseTransaction, ledger.CodeReferralExpense, "NGN")
-		if err != nil {
-			return err
-		}
-		if _, err := service.ledger.Post(databaseTransaction, ledger.Entry{
-			Reference: "REFERRAL-" + earningID, TransactionType: "referral_award", Description: description,
-			Legs: ledger.MoveLegs(expense.ID, referralAccount.ID, amount, "Referral bonus"),
-		}); err != nil {
-			return err
-		}
-		return databaseTransaction.Create(&models.ReferralEarning{
-			ID: earningID, UserID: userID, FriendName: friendName, Description: description, AmountNgn: amount.UnitsString(), CreatedAt: time.Now().UTC(),
-		}).Error
-	})
 }

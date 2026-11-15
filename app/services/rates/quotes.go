@@ -11,6 +11,7 @@ import (
 	"github.com/tribe-africa/tribe-backend/app/models"
 	"github.com/tribe-africa/tribe-backend/app/services/shared"
 	"github.com/tribe-africa/tribe-backend/pkg/ids"
+	"github.com/tribe-africa/tribe-backend/pkg/money"
 )
 
 // CreateQuote prices a conversion and SAVES it, so the user can confirm at
@@ -49,6 +50,10 @@ func (service *Service) CreateQuote(requestContext context.Context, userID strin
 	if price.NairaIn != nil {
 		nairaIn, nairaOut := price.NairaIn.UnitsString(), price.NairaOut.UnitsString()
 		quote.NairaInAmount, quote.NairaOutAmount = &nairaIn, &nairaOut
+	}
+	if price.MarketReceived != nil {
+		marketToAmount := price.MarketReceived.UnitsString()
+		quote.MarketToAmount = &marketToAmount
 	}
 	if err := service.database.WithContext(requestContext).Create(&quote).Error; err != nil {
 		return nil, nil, err
@@ -112,6 +117,28 @@ func (service *Service) ConsumeQuote(databaseTransaction *gorm.DB, quoteID strin
 		return nil, err
 	}
 	return &quote, nil
+}
+
+// MarginAmountsOf reads the amounts a quote saved for booking our margin
+// (see ledger.ConversionAmounts): the Naira in and out on the NGN rail, or
+// the market value of what is received on any other route. Each is nil
+// when the quote has none.
+func MarginAmountsOf(quote *models.Quote) (nairaIn *money.Amount, nairaOut *money.Amount, marketReceived *money.Amount) {
+	parse := func(text *string) *money.Amount {
+		if text == nil {
+			return nil
+		}
+		amount, err := money.ParseUnits(*text)
+		if err != nil {
+			return nil
+		}
+		return &amount
+	}
+	nairaIn, nairaOut = parse(quote.NairaInAmount), parse(quote.NairaOutAmount)
+	if nairaIn == nil || nairaOut == nil {
+		nairaIn, nairaOut = nil, nil
+	}
+	return nairaIn, nairaOut, parse(quote.MarketToAmount)
 }
 
 // RouteOf decodes the route saved on a quote.

@@ -46,7 +46,11 @@ Controllers never touch the database for business logic. Services never read `gi
 5. Money routes re-check the device inside the transaction (`shared.LockActor`) and need a quote (when currencies differ) plus the PIN.
 6. Write the inbox message (`shared.Notify` / `shared.NotifyTransaction`) inside the same transaction. The scheduler's push outbox sends the push.
 7. Treasury funding is two-person: one admin requests, a **different** admin approves, and only approval posts.
-   - Manual customer credits & debits (`customer_adjustments`) are two-person too, and only a **super admin** (every permission, `adminauth.IsSuperAdmin`) may approve. A credit must fit the vault's free funds (`ledger.FreeFundsOf`); a debit must fit the wallet.
+   - Manual customer credits & debits (`customer_adjustments`) are two-person too, and only a **super admin** (every permission, `adminauth.IsSuperAdmin`) may approve. A credit is paid from the currency's **Tribe Funds** and must fit its balance; a debit must fit the wallet.
+   - **The providers hold the money; the ledger mirrors them.** Only three kinds of account exist: provider vaults (`provider_vault`, one per provider per currency in `provider_assets`), customer balances, and **Tribe Funds** (`tribe_funds`, one per currency). Per currency, Tribe Funds = Σ provider vaults − Σ owed to customers; `assertBooksBalance` checks it in every integration test. Never add another company account.
+   - Money leaves a provider vault when the provider is instructed (payouts, bills, gift cards); a refusal reverses or refunds it. Use the currency's home vault (`ledger.HomeVault`) unless the product has its own provider (`products.productVault`). Card money also moves to the card issuer's vault (`cardMoneyLegs`).
+   - Every fee and conversion margin lands in Tribe Funds, tagged with `Leg.Source`. On every route that is not the NGN rail, pass `MarketReceived` (from the quote or price) so the margin is booked.
+   - An invited customer's money flow calls `referrals.Prepare` BEFORE its transaction, sets `ReferralShare: invitation.ShareOf()` on the posting, and `referrals.Record` after it. Flows a provider must confirm pay the share when it confirms (`referrals.PayAccrued`) and cancel it on refusal (`referrals.Cancel`). See `docs/ACCOUNTING.md`.
 8. New posting rules need a case in `app/services/ledger/rules_test.go` proving they balance per asset, and a note in `docs/ACCOUNTING.md`.
    - Gift-card and cashpoint postings are still **pending accountant sign-off**.
 
